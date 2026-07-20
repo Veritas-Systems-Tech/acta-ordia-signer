@@ -1,0 +1,82 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Acta Ordia Signer</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        margin: 0;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        height: 100vh;
+        background: #1a1a2e;
+        color: #f0f0f0;
+      }
+      form {
+        width: 100%;
+        max-width: 320px;
+        padding: 24px;
+      }
+      h1 { font-size: 15px; font-weight: 600; margin: 0 0 4px; }
+      p { font-size: 13px; color: #a0a0b0; margin: 0 0 16px; }
+      input {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 8px 10px;
+        border-radius: 6px;
+        border: 1px solid #3a3a55;
+        background: #23233a;
+        color: #f0f0f0;
+        font-size: 14px;
+        margin-bottom: 12px;
+      }
+      .row { display: flex; gap: 8px; }
+      button {
+        flex: 1;
+        padding: 8px 10px;
+        border-radius: 6px;
+        border: none;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      button[type="submit"] { background: #e8c96b; color: #1a1a2e; font-weight: 600; }
+      button[type="button"] { background: #3a3a55; color: #f0f0f0; }
+      #error { color: #ff8080; font-size: 12px; min-height: 16px; margin: -4px 0 8px; }
+    </style>
+  </head>
+  <body>
+    <form id="form">
+      <h1>Certificate password</h1>
+      <p>Enter the password for the selected .p12 certificate. This stays on your machine — it is never sent to Acta Ordia.</p>
+      <input type="password" id="passphrase" autocomplete="current-password" autofocus />
+      <div id="error"></div>
+      <div class="row">
+        <button type="button" id="cancel">Cancel</button>
+        <button type="submit">Unlock</button>
+      </div>
+    </form>
+    <script>
+      const { invoke } = window.__TAURI__.core;
+      const form = document.getElementById("form");
+      const input = document.getElementById("passphrase");
+      const errorEl = document.getElementById("error");
+
+      form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        errorEl.textContent = "";
+        try {
+          await invoke("submit_passphrase", { value: input.value });
+        } catch (err) {
+          errorEl.textContent = String(err);
+        }
+      });
+
+      document.getElementById("cancel").addEventListener("click", async () => {
+        await invoke("cancel_passphrase");
+      });
+    </script>
+  </body>
+</html>

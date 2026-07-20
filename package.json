@@ -1,0 +1,13 @@
+{
+  "name": "acta-ordia-signer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Acta Ordia ICP-Brasil signing agent (Tauri) — scaffold only, see README.md",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

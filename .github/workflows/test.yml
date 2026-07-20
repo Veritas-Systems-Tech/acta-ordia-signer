@@ -1,0 +1,69 @@
+# ============================================
+# Test — acta-ordia-signer
+# ============================================
+# Runs on every push and pull request, across all 3 target platforms —
+# Tauri uses a different native webview backend per OS (WebKitGTK on
+# Linux, WKWebView on macOS, WebView2 on Windows), so "compiles on Linux"
+# does not prove it compiles everywhere.
+#
+# Jobs:
+#   test — cargo build + cargo test + cargo clippy (deny warnings)
+
+name: Test
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+jobs:
+  test:
+    name: Test (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-latest
+          - platform: macos-latest
+          - platform: windows-latest
+    runs-on: ${{ matrix.platform }}
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev libssl-dev libayatana-appindicator3-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ matrix.platform }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+
+      - name: cargo build
+        working-directory: src-tauri
+        run: cargo build --verbose
+
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test --verbose
+
+      - name: cargo clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings

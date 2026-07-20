@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-submit-passphrase"
+description = "Enables the submit_passphrase command without any pre-configured scope."
+commands.allow = ["submit_passphrase"]
+
+[[permission]]
+identifier = "deny-submit-passphrase"
+description = "Denies the submit_passphrase command without any pre-configured scope."
+commands.deny = ["submit_passphrase"]
