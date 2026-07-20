@@ -39,3 +39,11 @@ zeroize = "1"
 # safe to ship in an open-source binary. Tests generate an ephemeral keypair
 # via getrandom (already a dep), so the `rand_core` feature isn't needed.
 ed25519-dalek = "2"
+# Crash/error reporting — separate Sentry project from the main acta-ordia
+# app (different org member, different runtime). Only crash reports and
+# coarse error *codes* are ever sent (see telemetry.rs) — never passphrases,
+# file paths, or certificate contents. `panic` feature auto-reports Rust
+# panics, which matters here specifically because we have zero visibility
+# into real end-user machines (no real ICP-Brasil cert has been tested
+# against this build yet — see pending-user-actions memory).
+sentry = { version = "0.34", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }

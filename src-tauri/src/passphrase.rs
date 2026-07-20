@@ -7,12 +7,7 @@
 //! fires. Window creation itself is dispatched onto the main thread via
 //! `run_on_main_thread` — UI operations aren't guaranteed thread-safe on
 //! every platform (notably macOS).
-//!
-//! ⚠️ Unverified: this module has not been exercised against a real
-//! `cargo build` in this environment (blocked on missing system deps — see
-//! the main repo's memory). The `run_on_main_thread` API shape should be
-//! re-checked against the actual installed `tauri` crate version before
-//! trusting this compiles as written.
+
 
 use std::sync::mpsc::{self, Sender};
 use std::sync::Mutex;

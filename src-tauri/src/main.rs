@@ -5,6 +5,7 @@ mod passphrase;
 mod protocol;
 mod server;
 mod state;
+mod telemetry;
 
 use tauri::{
     menu::{Menu, MenuItem},
@@ -16,6 +17,10 @@ use passphrase::{cancel_passphrase, submit_passphrase, PassphraseChannel};
 use state::SigningState;
 
 fn main() {
+    // Held for the whole process lifetime (main() blocks on tauri's .run()
+    // until exit) — dropping it early would stop flushing events.
+    let _sentry_guard = telemetry::init();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // A second launch focuses/no-ops instead of binding the port twice.

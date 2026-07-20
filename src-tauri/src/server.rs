@@ -273,7 +273,10 @@ fn read_body_capped(request: &mut tiny_http::Request) -> String {
 fn handle_prepare(app: &AppHandle, body: &str) -> tiny_http::ResponseBox {
     let req: PrepareRequest = match serde_json::from_str(body) {
         Ok(r) => r,
-        Err(err) => return json_response(&ErrorResponse::new("invalid_request", err.to_string()), 400),
+        Err(err) => {
+            crate::telemetry::report("prepare_invalid_request");
+            return json_response(&ErrorResponse::new("invalid_request", err.to_string()), 400);
+        }
     };
 
     // Non-blocking dialog + bounded wait, so an unanswered dialog can't
@@ -295,7 +298,10 @@ fn handle_prepare(app: &AppHandle, body: &str) -> tiny_http::ResponseBox {
         Ok(false) => {
             return json_response(&ErrorResponse::new("cancelled", "Signing was cancelled by the user."), 409)
         }
-        Err(_) => return json_response(&ErrorResponse::new("timeout", "The confirmation dialog timed out."), 408),
+        Err(_) => {
+            crate::telemetry::report("confirm_dialog_timeout");
+            return json_response(&ErrorResponse::new("timeout", "The confirmation dialog timed out."), 408);
+        }
     }
 
     let (pick_tx, pick_rx) = mpsc::channel();
@@ -307,19 +313,28 @@ fn handle_prepare(app: &AppHandle, body: &str) -> tiny_http::ResponseBox {
         });
     let picked = match pick_rx.recv_timeout(DIALOG_TIMEOUT) {
         Ok(p) => p,
-        Err(_) => return json_response(&ErrorResponse::new("timeout", "The certificate picker timed out."), 408),
+        Err(_) => {
+            crate::telemetry::report("file_picker_timeout");
+            return json_response(&ErrorResponse::new("timeout", "The certificate picker timed out."), 408);
+        }
     };
     let Some(file_path) = picked else {
         return json_response(&ErrorResponse::new("no_certificate", "No certificate file was selected."), 422);
     };
     let path = match file_path.into_path() {
         Ok(p) => p,
-        Err(err) => return json_response(&ErrorResponse::new("invalid_path", err.to_string()), 500),
+        Err(err) => {
+            crate::telemetry::report("invalid_path");
+            return json_response(&ErrorResponse::new("invalid_path", err.to_string()), 500);
+        }
     };
     // Zeroizing: scrub the raw .p12 from heap memory on drop (finding 2).
     let p12_bytes = match std::fs::read(&path) {
         Ok(b) => Zeroizing::new(b),
-        Err(err) => return json_response(&ErrorResponse::new("read_failed", err.to_string()), 500),
+        Err(err) => {
+            crate::telemetry::report("read_failed");
+            return json_response(&ErrorResponse::new("read_failed", err.to_string()), 500);
+        }
     };
 
     let Some(passphrase) = prompt_passphrase(app) else {
@@ -328,13 +343,17 @@ fn handle_prepare(app: &AppHandle, body: &str) -> tiny_http::ResponseBox {
 
     let pkcs12 = match Pkcs12::from_der(&p12_bytes) {
         Ok(p) => p,
-        Err(err) => return json_response(&ErrorResponse::new("invalid_certificate", err.to_string()), 422),
+        Err(err) => {
+            crate::telemetry::report("invalid_certificate_der");
+            return json_response(&ErrorResponse::new("invalid_certificate", err.to_string()), 422);
+        }
     };
     let parsed = match pkcs12.parse2(&passphrase) {
         Ok(p) => p,
         Err(_) => return json_response(&ErrorResponse::new("wrong_password", "Incorrect certificate password."), 422),
     };
     let (Some(cert), Some(private_key)) = (parsed.cert, parsed.pkey) else {
+        crate::telemetry::report("certificate_missing_cert_or_key");
         return json_response(&ErrorResponse::new("invalid_certificate", "The .p12 file has no certificate/key pair."), 422);
     };
 
@@ -386,7 +405,14 @@ fn handle_sign(signing_state: &SigningState, body: &str) -> tiny_http::ResponseB
     // attacker-chosen digest (the agent_token below is only a secondary
     // session-binding convenience). A failure here rejects WITHOUT consuming
     // the single-use session, so a legitimate retry can still complete.
+    //
+    // Reported to Sentry: this is also the only signal that would ever catch
+    // a deployed-key mismatch (the embedded PKI_DIGEST_PUBLIC_KEY_HEX not
+    // actually pairing with the backend's real Secret Manager private key) —
+    // that failure mode is otherwise completely silent and would 403 every
+    // single real signing attempt forever (see pending-user-actions memory).
     if let Err(err) = verify_digest_signature(&active_digest_verifying_key(), &digest, &req.digest_signature_base64) {
+        crate::telemetry::report("invalid_digest_signature");
         return json_response(
             &ErrorResponse::new(
                 "invalid_digest_signature",
@@ -418,7 +444,10 @@ fn handle_sign(signing_state: &SigningState, body: &str) -> tiny_http::ResponseB
 
     let signature = match sign_digest_info(&private_key, &digest_info) {
         Ok(sig) => sig,
-        Err(err) => return json_response(&ErrorResponse::new("sign_failed", err), 500),
+        Err(err) => {
+            crate::telemetry::report("sign_failed");
+            return json_response(&ErrorResponse::new("sign_failed", err), 500);
+        }
     };
 
     json_response(&SignDigestResponse { signature_base64: BASE64.encode(signature) }, 200)
