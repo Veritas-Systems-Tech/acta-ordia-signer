@@ -21,10 +21,17 @@ tiny_http = "0.12"
 # (Rsa::private_encrypt with Padding::PKCS1) — the same primitive verified
 # against forge's public-key verify() on the backend side (see cms.ts's
 # header in the main repo for why it must be raw-encrypt, not a hashing
-# sign call). Uses the system OpenSSL via the `openssl` crate rather than a
-# second pure-Rust crypto stack (p12 + rsa crates) since this machine
-# already depends on system OpenSSL for other tooling.
-openssl = "0.10"
+# sign call).
+#
+# `vendored`: builds and statically links OpenSSL from source instead of
+# depending on a system install. Not just a CI convenience — a real end-user
+# Windows machine essentially never has OpenSSL installed system-wide (this
+# was confirmed the hard way: CI's windows-latest job failed outright with
+# "Could not find directory of OpenSSL installation" until this was added),
+# so an unvendored build would have silently been unshippable on Windows.
+# Tradeoff: slower compiles, and this binary now needs its own updates for
+# OpenSSL security patches rather than inheriting the OS's.
+openssl = { version = "0.10", features = ["vendored"] }
 base64 = "0.22"
 # Per-session shared secret between /prepare and /sign — see server.rs. OS
 # CSPRNG only; version pinned to the 0.3.x line already resolved in Cargo.lock
