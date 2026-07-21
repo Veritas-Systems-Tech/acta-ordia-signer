@@ -83,17 +83,7 @@ jobs:
         if: matrix.platform == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev libssl-dev libayatana-appindicator3-dev libfuse2
-          # Two prior attempts at fixing "failed to run linuxdeploy" (libfuse2
-          # alone, then + APPIMAGE_EXTRACT_AND_RUN=1) both still failed on a
-          # real release run — tauri-bundler swallows linuxdeploy's actual
-          # stderr, so the true root cause was never directly visible. This
-          # exact failure mode is widely reported against Ubuntu 24.04
-          # GitHub-hosted runners specifically: AppArmor's unprivileged-user-
-          # namespace restriction (default-on since 24.04) can still block a
-          # subprocess AppImage tooling spawns internally even during
-          # self-extraction. Relaxing it is the standard CI workaround.
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev libssl-dev libayatana-appindicator3-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -113,15 +103,19 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # linuxdeploy (AppImage bundler) is itself an AppImage, which needs
-          # FUSE to mount-and-run — GitHub's ubuntu-latest runners restrict
-          # unprivileged FUSE mounting even with libfuse2 installed (confirmed
-          # via a real failed release run: "failed to run linuxdeploy" even
-          # after adding libfuse2). This makes AppImage tooling self-extract
-          # to a temp dir and run directly instead of FUSE-mounting.
-          APPIMAGE_EXTRACT_AND_RUN: "1"
         with:
           projectPath: src-tauri
+          # Linux: .deb/.rpm only, no AppImage. Three targeted fixes (libfuse2,
+          # APPIMAGE_EXTRACT_AND_RUN=1, relaxing AppArmor's unprivileged-userns
+          # restriction) all still failed identically on real release runs with
+          # "failed to run linuxdeploy" — tauri-bundler never surfaces the
+          # underlying error, so the true cause was never directly diagnosable.
+          # .deb/.rpm bundled successfully on every single attempt, and are the
+          # install method most Linux users actually expect anyway. Tradeoff:
+          # Tauri's auto-updater only supports AppImage on Linux, so .deb/.rpm
+          # installs won't self-update — same as most native package-manager
+          # software, updated via a new download rather than in-place.
+          args: ${{ matrix.platform == 'ubuntu-latest' && '--bundles deb,rpm' || '' }}
           tagName: staging-${{ github.ref_name }}
           releaseName: 'Internal staging — ${{ github.ref_name }} (not for end users)'
           releaseBody: 'Temporary artifact staging for the publish job. Deleted automatically once mirrored to Cloud Storage.'
