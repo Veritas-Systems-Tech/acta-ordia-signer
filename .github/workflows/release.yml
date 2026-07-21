@@ -21,36 +21,37 @@
 # 2. `publish` (needs: build, runs once after all 3 platforms finish):
 #    downloads every asset from that temporary release via the GitHub API
 #    (authenticated with GITHUB_TOKEN — works fine against our own private
-#    repo), re-uploads the installer files AND a rewritten `latest.json`
-#    (URLs pointed at our own hosting, not github.com) to a DEDICATED
-#    Firebase Hosting site, then deletes the temporary GitHub release + tag.
+#    repo), rewrites `latest.json`'s URLs to point at our own storage
+#    instead of github.com, and uploads everything to a dedicated public
+#    Cloud Storage bucket, then deletes the temporary GitHub release + tag.
 #
-#    Deliberately NOT deployed to the same Hosting site/target as the main
-#    app (`acta-ordia`'s "app" target): a Hosting deploy replaces a site's
-#    entire content each release, so sharing a target with a second,
-#    independent CI pipeline would wipe out the live web app on every
-#    signer release. Uses its own site (`acta-ordia-downloads`, see
-#    .firebaserc/firebase.json in this repo) in the same GCP project
-#    instead — isolated blast radius, same billing/project, no new infra.
+#    Deliberately a GCS bucket, not Firebase Hosting: a Hosting deploy
+#    replaces a site's *entire* content on every release, so an independent
+#    CI pipeline deploying to the same site as the main app/website would
+#    wipe it out on every signer release (and vice versa). GCS uploads are
+#    additive, object-by-object — no such risk, and no separate "site" to
+#    manage either (just a bucket in the same GCP project the app already
+#    uses). Not put behind a Hosting rewrite on the app's own domain either,
+#    since that would add a Cloud Function/Run proxy purely to serve large
+#    binary downloads — GCS's own public URLs are the simpler, more direct
+#    path for this. A friendlier domain can be layered on top later (Cloud
+#    CDN + load balancer) without changing anything here.
 #
 # Required GitHub Secrets (see acta-ordia-signer README for how to obtain):
 #   TAURI_SIGNING_PRIVATE_KEY          — from `cargo tauri signer generate`
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD — password for that key (may be empty)
 #
-# Required one-time GCP/Firebase setup (same acta-ordia Firebase project the
-# main app uses — see .firebaserc in this repo for the exact site name):
-#   1. `firebase hosting:sites:create acta-ordia-downloads --project acta-ordia`
-#   2. Workload Identity Federation pool "github-actions-pool" / provider
-#      "github-provider" must include this repo
-#      (igor-veritas/acta-ordia-signer) in its attribute condition — it was
-#      originally scoped to acta-ordia / acta-ordia-website only.
-#   3. Grant firebase-adminsdk-fbsvc@acta-ordia.iam.gserviceaccount.com
-#      hosting deploy rights on the new site (same role it already has for
-#      the other sites in this project is normally sufficient project-wide).
-#   4. Optional: map a real domain (e.g. downloads.actaordia.com) to the new
-#      site in the Firebase console instead of using the default
-#      acta-ordia-downloads.web.app — update tauri.conf.json's updater
-#      endpoint + the app's download-page links to match once decided.
+# Required one-time GCP setup (same acta-ordia project the main app uses):
+#   `gcloud storage buckets create gs://acta-ordia-signer-downloads
+#      --project=acta-ordia --location=us-central1 --uniform-bucket-level-access`
+#   then grant public read: `gcloud storage buckets add-iam-policy-binding
+#      gs://acta-ordia-signer-downloads --member=allUsers --role=roles/storage.objectViewer`
+#   WIF (github-actions-pool/github-provider) and the deploying service
+#   account (firebase-adminsdk-fbsvc@acta-ordia.iam.gserviceaccount.com,
+#   already has project-wide roles/storage.admin) both already cover this
+#   repo — no additional grants needed, verified directly against the live
+#   IAM policy (provider condition is `repository_owner == 'igor-veritas'`,
+#   not scoped per-repo).
 
 name: Release
 
@@ -106,13 +107,13 @@ jobs:
           projectPath: src-tauri
           tagName: staging-${{ github.ref_name }}
           releaseName: 'Internal staging — ${{ github.ref_name }} (not for end users)'
-          releaseBody: 'Temporary artifact staging for the publish job. Deleted automatically once mirrored to app.actaordia.com/downloads/signer/.'
+          releaseBody: 'Temporary artifact staging for the publish job. Deleted automatically once mirrored to Cloud Storage.'
           releaseDraft: false
           prerelease: true
           includeUpdaterJson: true
 
   publish:
-    name: Mirror to Firebase Hosting
+    name: Mirror to Cloud Storage
     needs: build
     runs-on: ubuntu-latest
 
@@ -134,17 +135,16 @@ jobs:
             --dir mirror/${{ github.ref_name }} \
             --pattern "*"
 
-      - name: Rewrite latest.json URLs to point at our own hosting
+      - name: Rewrite latest.json URLs to point at our own bucket
         run: |
-          # DOWNLOADS_BASE_URL: update this (and tauri.conf.json's updater
-          # endpoint) if a custom domain is later mapped to the
-          # acta-ordia-downloads Hosting site instead of its default one.
-          DOWNLOADS_BASE_URL="https://acta-ordia-downloads.web.app"
+          # BASE_URL: update this (and tauri.conf.json's updater endpoint) if
+          # a custom domain is later put in front of this bucket.
+          BASE_URL="https://storage.googleapis.com/acta-ordia-signer-downloads"
           node -e "
             const fs = require('fs');
             const path = 'mirror/${{ github.ref_name }}/latest.json';
             const manifest = JSON.parse(fs.readFileSync(path, 'utf8'));
-            const base = '${DOWNLOADS_BASE_URL}/signer/${{ github.ref_name }}';
+            const base = '${BASE_URL}/signer/${{ github.ref_name }}';
             for (const key of Object.keys(manifest.platforms)) {
               const entry = manifest.platforms[key];
               const filename = entry.url.split('/').pop();
@@ -152,25 +152,32 @@ jobs:
             }
             fs.writeFileSync(path, JSON.stringify(manifest, null, 2));
           "
-          # Also drop a copy at the stable /latest.json path tauri.conf.json's
-          # updater endpoint points at (always "the current latest release").
-          mkdir -p mirror/signer
-          cp -r mirror/${{ github.ref_name }}/. mirror/signer/${{ github.ref_name }}/ 2>/dev/null || \
-            (mkdir -p mirror/signer/${{ github.ref_name }} && cp mirror/${{ github.ref_name }}/* mirror/signer/${{ github.ref_name }}/)
-          cp "mirror/${{ github.ref_name }}/latest.json" mirror/latest.json
-          rm -rf "mirror/${{ github.ref_name }}"
+          # Also drop a copy at the stable signer/latest.json path
+          # tauri.conf.json's updater endpoint points at (always "the
+          # current latest release").
+          cp "mirror/${{ github.ref_name }}/latest.json" mirror/${{ github.ref_name }}/latest.json.versioned
+          mkdir -p mirror-flat
+          cp "mirror/${{ github.ref_name }}"/* mirror-flat/
 
       - name: Authenticate to GCP (Workload Identity Federation)
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: projects/66429062436/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
           service_account: firebase-adminsdk-fbsvc@acta-ordia.iam.gserviceaccount.com
-          create_credentials_file: true
-          export_environment_variables: true
 
-      - name: Deploy to the dedicated downloads Hosting site
-        working-directory: .
-        run: npx firebase-tools@14 deploy --project acta-ordia --only hosting:downloads --non-interactive
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Upload to gs://acta-ordia-signer-downloads
+        run: |
+          VERSION_DIR="signer/${{ github.ref_name }}"
+          gcloud storage cp mirror-flat/latest.json.versioned "gs://acta-ordia-signer-downloads/${VERSION_DIR}/latest.json"
+          for f in mirror-flat/*; do
+            [ "$(basename "$f")" = "latest.json.versioned" ] && continue
+            gcloud storage cp "$f" "gs://acta-ordia-signer-downloads/${VERSION_DIR}/$(basename "$f")"
+          done
+          # Stable "always the latest" manifest the updater endpoint checks.
+          gcloud storage cp mirror-flat/latest.json.versioned "gs://acta-ordia-signer-downloads/signer/latest.json"
 
       - name: Delete the temporary staging release + tag
         if: always()

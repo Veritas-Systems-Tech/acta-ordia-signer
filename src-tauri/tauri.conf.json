@@ -28,7 +28,7 @@
     "updater": {
       "active": true,
       "endpoints": [
-        "https://acta-ordia-downloads.web.app/latest.json"
+        "https://storage.googleapis.com/acta-ordia-signer-downloads/signer/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEI0OTBGQjk0OTJCMERCNUYKUldSZjI3Q1NsUHVRdEo5ZWFOQkNadTErS0cvdWhNaUZJd2d0QTl1Uk9tNUplelIxTjF0Qm1YU0sK"
     }
