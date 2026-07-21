@@ -1,0 +1,180 @@
+# ============================================
+# Release — acta-ordia-signer
+# ============================================
+# Triggers on pushing a version tag (v0.1.0, v0.2.0, ...). Builds signed,
+# updater-ready bundles for Linux/macOS/Windows and publishes them to our
+# own hosting — NOT GitHub Releases. End users never see this repo or
+# GitHub at all; it exists purely as a private CI staging ground.
+#
+# How this works, in two stages:
+#
+# 1. `build` (matrix, one job per platform): runs `tauri-apps/tauri-action`,
+#    which builds the native bundle for that OS AND signs it with the
+#    updater's private key (via TAURI_SIGNING_PRIVATE_KEY[_PASSWORD]).
+#    It publishes those signed bundles to a temporary, unlisted GitHub
+#    Release in THIS PRIVATE REPO — used purely as a well-tested way to get
+#    tauri-action's own correctly-generated updater manifest fragment
+#    (exact bundle filenames/signature format), rather than us hand-rolling
+#    that. This release is never advertised to end users and is deleted by
+#    the publish job below once its assets are mirrored elsewhere.
+#
+# 2. `publish` (needs: build, runs once after all 3 platforms finish):
+#    downloads every asset from that temporary release via the GitHub API
+#    (authenticated with GITHUB_TOKEN — works fine against our own private
+#    repo), re-uploads the installer files AND a rewritten `latest.json`
+#    (URLs pointed at our own hosting, not github.com) to a DEDICATED
+#    Firebase Hosting site, then deletes the temporary GitHub release + tag.
+#
+#    Deliberately NOT deployed to the same Hosting site/target as the main
+#    app (`acta-ordia`'s "app" target): a Hosting deploy replaces a site's
+#    entire content each release, so sharing a target with a second,
+#    independent CI pipeline would wipe out the live web app on every
+#    signer release. Uses its own site (`acta-ordia-downloads`, see
+#    .firebaserc/firebase.json in this repo) in the same GCP project
+#    instead — isolated blast radius, same billing/project, no new infra.
+#
+# Required GitHub Secrets (see acta-ordia-signer README for how to obtain):
+#   TAURI_SIGNING_PRIVATE_KEY          — from `cargo tauri signer generate`
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD — password for that key (may be empty)
+#
+# Required one-time GCP/Firebase setup (same acta-ordia Firebase project the
+# main app uses — see .firebaserc in this repo for the exact site name):
+#   1. `firebase hosting:sites:create acta-ordia-downloads --project acta-ordia`
+#   2. Workload Identity Federation pool "github-actions-pool" / provider
+#      "github-provider" must include this repo
+#      (igor-veritas/acta-ordia-signer) in its attribute condition — it was
+#      originally scoped to acta-ordia / acta-ordia-website only.
+#   3. Grant firebase-adminsdk-fbsvc@acta-ordia.iam.gserviceaccount.com
+#      hosting deploy rights on the new site (same role it already has for
+#      the other sites in this project is normally sufficient project-wide).
+#   4. Optional: map a real domain (e.g. downloads.actaordia.com) to the new
+#      site in the Firebase console instead of using the default
+#      acta-ordia-downloads.web.app — update tauri.conf.json's updater
+#      endpoint + the app's download-page links to match once decided.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-latest
+          - platform: macos-latest
+          - platform: windows-latest
+    runs-on: ${{ matrix.platform }}
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev libssl-dev libayatana-appindicator3-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ matrix.platform }}-release-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+
+      - name: Build + sign via tauri-action (staged to a temporary private release)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: src-tauri
+          tagName: staging-${{ github.ref_name }}
+          releaseName: 'Internal staging — ${{ github.ref_name }} (not for end users)'
+          releaseBody: 'Temporary artifact staging for the publish job. Deleted automatically once mirrored to app.actaordia.com/downloads/signer/.'
+          releaseDraft: false
+          prerelease: true
+          includeUpdaterJson: true
+
+  publish:
+    name: Mirror to Firebase Hosting
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all assets from the temporary staging release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p mirror/${{ github.ref_name }}
+          gh release download "staging-${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --dir mirror/${{ github.ref_name }} \
+            --pattern "*"
+
+      - name: Rewrite latest.json URLs to point at our own hosting
+        run: |
+          # DOWNLOADS_BASE_URL: update this (and tauri.conf.json's updater
+          # endpoint) if a custom domain is later mapped to the
+          # acta-ordia-downloads Hosting site instead of its default one.
+          DOWNLOADS_BASE_URL="https://acta-ordia-downloads.web.app"
+          node -e "
+            const fs = require('fs');
+            const path = 'mirror/${{ github.ref_name }}/latest.json';
+            const manifest = JSON.parse(fs.readFileSync(path, 'utf8'));
+            const base = '${DOWNLOADS_BASE_URL}/signer/${{ github.ref_name }}';
+            for (const key of Object.keys(manifest.platforms)) {
+              const entry = manifest.platforms[key];
+              const filename = entry.url.split('/').pop();
+              entry.url = base + '/' + filename;
+            }
+            fs.writeFileSync(path, JSON.stringify(manifest, null, 2));
+          "
+          # Also drop a copy at the stable /latest.json path tauri.conf.json's
+          # updater endpoint points at (always "the current latest release").
+          mkdir -p mirror/signer
+          cp -r mirror/${{ github.ref_name }}/. mirror/signer/${{ github.ref_name }}/ 2>/dev/null || \
+            (mkdir -p mirror/signer/${{ github.ref_name }} && cp mirror/${{ github.ref_name }}/* mirror/signer/${{ github.ref_name }}/)
+          cp "mirror/${{ github.ref_name }}/latest.json" mirror/latest.json
+          rm -rf "mirror/${{ github.ref_name }}"
+
+      - name: Authenticate to GCP (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/66429062436/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
+          service_account: firebase-adminsdk-fbsvc@acta-ordia.iam.gserviceaccount.com
+          create_credentials_file: true
+          export_environment_variables: true
+
+      - name: Deploy to the dedicated downloads Hosting site
+        working-directory: .
+        run: npx firebase-tools@14 deploy --project acta-ordia --only hosting:downloads --non-interactive
+
+      - name: Delete the temporary staging release + tag
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete "staging-${{ github.ref_name }}" --repo "${{ github.repository }}" --yes --cleanup-tag || true

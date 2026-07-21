@@ -26,11 +26,11 @@
   },
   "plugins": {
     "updater": {
-      "active": false,
+      "active": true,
       "endpoints": [
-        "https://TODO-set-real-release-endpoint.actaordia.com/{{target}}/{{arch}}/{{current_version}}"
+        "https://acta-ordia-downloads.web.app/latest.json"
       ],
-      "pubkey": "TODO-generate-with-`cargo tauri signer generate`-before-first-release"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEI0OTBGQjk0OTJCMERCNUYKUldSZjI3Q1NsUHVRdEo5ZWFOQkNadTErS0cvdWhNaUZJd2d0QTl1Uk9tNUplelIxTjF0Qm1YU0sK"
     }
   }
 }
