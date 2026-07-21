@@ -190,6 +190,28 @@ jobs:
           # Stable "always the latest" manifest the updater endpoint checks.
           gcloud storage cp mirror-flat/latest.json.versioned "gs://acta-ordia-signer-downloads/signer/latest.json"
 
+      - name: Publish stable, version-agnostic download links (signer/latest/)
+        run: |
+          # Every bundled filename embeds the version (e.g.
+          # ActaOrdiaSigner_0.1.0_amd64.deb), so a download page can't hardcode
+          # a link straight to the versioned path without breaking on the next
+          # release. Copy each real artifact to a fixed name under
+          # signer/latest/ instead, so the app's download page can link to a
+          # stable URL that always resolves to whatever shipped most recently.
+          declare -A STABLE_NAMES=(
+            ["*.deb"]="ActaOrdiaSigner-linux-amd64.deb"
+            ["*.rpm"]="ActaOrdiaSigner-linux-x86_64.rpm"
+            ["*x64-setup.exe"]="ActaOrdiaSigner-windows-x64-setup.exe"
+            ["*x64_en-US.msi"]="ActaOrdiaSigner-windows-x64.msi"
+            ["*aarch64.dmg"]="ActaOrdiaSigner-macos-aarch64.dmg"
+          )
+          for pattern in "${!STABLE_NAMES[@]}"; do
+            match=$(compgen -G "mirror-flat/$pattern" | grep -v '\.sig$' | head -1 || true)
+            if [ -n "$match" ]; then
+              gcloud storage cp "$match" "gs://acta-ordia-signer-downloads/signer/latest/${STABLE_NAMES[$pattern]}"
+            fi
+          done
+
       - name: Delete the temporary staging release + tag
         if: always()
         env:
