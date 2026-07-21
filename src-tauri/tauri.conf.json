@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Acta Ordia Signer",
+  "productName": "ActaOrdiaSigner",
   "version": "0.1.0",
   "identifier": "com.actaordia.signer",
   "build": {
