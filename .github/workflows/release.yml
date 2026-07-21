@@ -103,6 +103,13 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # linuxdeploy (AppImage bundler) is itself an AppImage, which needs
+          # FUSE to mount-and-run — GitHub's ubuntu-latest runners restrict
+          # unprivileged FUSE mounting even with libfuse2 installed (confirmed
+          # via a real failed release run: "failed to run linuxdeploy" even
+          # after adding libfuse2). This makes AppImage tooling self-extract
+          # to a temp dir and run directly instead of FUSE-mounting.
+          APPIMAGE_EXTRACT_AND_RUN: "1"
         with:
           projectPath: src-tauri
           tagName: staging-${{ github.ref_name }}
