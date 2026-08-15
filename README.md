@@ -101,12 +101,13 @@ While `npm run dev` is running:
 
 ```bash
 curl http://127.0.0.1:7734/health
-# {"status":"ok","version":"0.1.0"}
+# {"status":"ok","version":"0.1.1"}
 ```
 
 ## Verified against real compiler output (2026-07-18, re-verified 2026-07-20)
 
-`cargo build`, `cargo check --release`, `cargo test` (29/29), and `cargo
+`cargo build`, `cargo check --release`, `cargo test` (51/51 across `main.rs`,
+`passphrase.rs`, `state.rs`, `server.rs`, `protocol.rs`), and `cargo
 clippy --all-targets -- -D warnings` (zero warnings) all pass cleanly on
 Linux, after installing `libgtk-3-dev libwebkit2gtk-4.1-dev
 libjavascriptcoregtk-4.1-dev libsoup-3.0-dev libssl-dev`. This confirms:
@@ -191,10 +192,6 @@ is the digest-signing step in `functions/src/signing/prepare-digest.ts` — the
   a first usable release; A3 brings far more driver/OS/support complexity).
 - **Deep-link protocol handler** (`actaordia-signer://`) — only the
   localhost HTTP fallback exists so far.
-- **Real update signing.** `tauri-plugin-updater` is wired but `active:
-  false` in `tauri.conf.json` — no real keypair has been generated yet. Run
-  `cargo tauri signer generate` and update the `pubkey`/`endpoints` before
-  the first real release.
 - **Signed binary distribution** (Apple Developer ID / Windows EV
   certificate) — builds today are unsigned, OS will show an
   "unknown publisher" warning.
@@ -206,12 +203,19 @@ is the digest-signing step in `functions/src/signing/prepare-digest.ts` — the
 
 ## Trust model
 
-- The agent's communication is local-only (`127.0.0.1`) — it does not
-  phone home. The origin allowlist stops browser-JS CSRF only; protection
-  against other local processes comes from verifying the backend's Ed25519
-  signature over the digest against the agent's embedded public key before
-  signing (the per-session `agent_token` is only a secondary session-binding
-  check, not the primary defense — see the security hardening notes above).
+- The agent's signing traffic is local-only (`127.0.0.1`) — the document,
+  the private key, and the passphrase never transit the network. The origin
+  allowlist stops browser-JS CSRF only; protection against other local
+  processes comes from verifying the backend's Ed25519 signature over the
+  digest against the agent's embedded public key before signing (the
+  per-session `agent_token` is only a secondary session-binding check, not
+  the primary defense — see the security hardening notes above).
+- The agent does send crash/error telemetry to a dedicated Sentry project
+  (`src-tauri/src/telemetry.rs`) — deliberately narrow: only static,
+  whitelisted error *codes* (e.g. `"invalid_certificate"`), never the error
+  message text, the passphrase, `.p12`/certificate bytes, or the acta title.
+  `send_default_pii` is off. This is disclosed here because "does not phone
+  home" would otherwise overstate what the agent does.
 - It signs only backend-issued Acta Ordia signing sessions — it is not a
   generic document signer for arbitrary input.
 - The private key is held in memory only, for a short TTL, single-use, and
