@@ -50,7 +50,7 @@
 #   account (firebase-adminsdk-fbsvc@acta-ordia.iam.gserviceaccount.com,
 #   already has project-wide roles/storage.admin) both already cover this
 #   repo — no additional grants needed, verified directly against the live
-#   IAM policy (provider condition is `repository_owner == 'igor-veritas'`,
+#   IAM policy (provider condition is `repository_owner == 'Veritas-Systems-Tech'`,
 #   not scoped per-repo).
 
 name: Release

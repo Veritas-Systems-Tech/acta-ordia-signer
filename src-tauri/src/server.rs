@@ -279,31 +279,6 @@ fn handle_prepare(app: &AppHandle, body: &str) -> tiny_http::ResponseBox {
         }
     };
 
-    // Non-blocking dialog + bounded wait, so an unanswered dialog can't
-    // wedge the single-threaded listener forever (finding 7).
-    let (confirm_tx, confirm_rx) = mpsc::channel();
-    app.dialog()
-        .message(format!(
-            "Acta Ordia is requesting your signature for \"{}\". Continue?",
-            sanitize_title(&req.acta_title)
-        ))
-        .title("Sign with Certificate")
-        .kind(MessageDialogKind::Info)
-        .buttons(MessageDialogButtons::OkCancel)
-        .show(move |confirmed| {
-            let _ = confirm_tx.send(confirmed);
-        });
-    match confirm_rx.recv_timeout(DIALOG_TIMEOUT) {
-        Ok(true) => {}
-        Ok(false) => {
-            return json_response(&ErrorResponse::new("cancelled", "Signing was cancelled by the user."), 409)
-        }
-        Err(_) => {
-            crate::telemetry::report("confirm_dialog_timeout");
-            return json_response(&ErrorResponse::new("timeout", "The confirmation dialog timed out."), 408);
-        }
-    }
-
     let (pick_tx, pick_rx) = mpsc::channel();
     app.dialog()
         .file()
@@ -358,6 +333,38 @@ fn handle_prepare(app: &AppHandle, body: &str) -> tiny_http::ResponseBox {
     };
 
     let subject_cn = subject_common_name(&cert).unwrap_or_default();
+
+    // Confirmation happens here, after the certificate is parsed, so the
+    // dialog can show WHICH identity (ICP-Brasil CN encodes "Name:CPF" or
+    // "Name:CNPJ") is about to sign, not just the acta title. Showing the
+    // title alone — the original order — let a user approve a signature
+    // without ever seeing whose certificate it would carry; sanitize_title
+    // covers the attacker-influenced half of this string, subject_cn comes
+    // from the certificate itself so it isn't spoofable the same way.
+    let (confirm_tx, confirm_rx) = mpsc::channel();
+    let dialog_subject = if subject_cn.is_empty() { "unknown subject".to_string() } else { subject_cn.clone() };
+    app.dialog()
+        .message(format!(
+            "Acta Ordia is requesting your signature for \"{}\", using the certificate for:\n{}\n\nContinue?",
+            sanitize_title(&req.acta_title),
+            dialog_subject
+        ))
+        .title("Sign with Certificate")
+        .kind(MessageDialogKind::Info)
+        .buttons(MessageDialogButtons::OkCancel)
+        .show(move |confirmed| {
+            let _ = confirm_tx.send(confirmed);
+        });
+    match confirm_rx.recv_timeout(DIALOG_TIMEOUT) {
+        Ok(true) => {}
+        Ok(false) => {
+            return json_response(&ErrorResponse::new("cancelled", "Signing was cancelled by the user."), 409)
+        }
+        Err(_) => {
+            crate::telemetry::report("confirm_dialog_timeout");
+            return json_response(&ErrorResponse::new("timeout", "The confirmation dialog timed out."), 408);
+        }
+    }
 
     let mut chain_der_base64 = Vec::new();
     match cert.to_der() {
