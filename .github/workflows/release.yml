@@ -3,8 +3,10 @@
 # ============================================
 # Triggers on pushing a version tag (v0.1.0, v0.2.0, ...). Builds signed,
 # updater-ready bundles for Linux/macOS/Windows and publishes them to our
-# own hosting — NOT GitHub Releases. End users never see this repo or
-# GitHub at all; it exists purely as a private CI staging ground.
+# own hosting — NOT GitHub Releases. End users never interact with this
+# repo or GitHub at all; this release flow exists purely as a CI staging
+# ground (temporary releases are deleted once their assets are mirrored —
+# see the publish job below).
 #
 # How this works, in two stages:
 #

@@ -193,13 +193,11 @@ is the digest-signing step in `functions/src/signing/prepare-digest.ts` — the
 - **Deep-link protocol handler** (`actaordia-signer://`) — only the
   localhost HTTP fallback exists so far.
 - **Signed binary distribution** (Apple Developer ID / Windows EV
-  certificate) — builds today are unsigned, OS will show an
-  "unknown publisher" warning.
-- **CPF/CNPJ display before signing** — the confirmation dialog currently
-  only shows the acta title, not the certificate's subject CN/CPF (that
-  isn't known until *after* the file is picked and parsed). Consider a
-  second, richer confirmation step after parsing but before returning the
-  chain to the web app.
+  certificate) — a deliberate, accepted tradeoff for now, not an oversight.
+  Builds are unsigned at the OS level (Gatekeeper/SmartScreen will show an
+  "unknown publisher" warning on first install); the update *channel*
+  itself is still cryptographically verified regardless — see "Trust
+  model" below.
 
 ## Trust model
 
@@ -221,3 +219,11 @@ is the digest-signing step in `functions/src/signing/prepare-digest.ts` — the
 - The private key is held in memory only, for a short TTL, single-use, and
   is never written to disk or logged.
 - Source is open — enterprise customers can audit or build from source.
+- **Update-channel integrity is separate from, and does not depend on, OS
+  code signing.** Every release is signed with a dedicated Tauri
+  updater keypair (`TAURI_SIGNING_PRIVATE_KEY`, a GitHub Secret, never
+  committed); the app verifies that signature against its embedded public
+  key (`tauri.conf.json`'s `plugins.updater.pubkey`) before installing an
+  update. A tampered or substituted update fails that check and is
+  refused, independent of whether the binary itself carries an OS-trusted
+  publisher signature.
