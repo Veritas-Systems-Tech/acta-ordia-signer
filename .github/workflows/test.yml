@@ -65,6 +65,27 @@ jobs:
         working-directory: src-tauri
         run: cargo build --verbose
 
+      # TEMPORARY diagnostic (to be removed once the Windows
+      # STATUS_ENTRYPOINT_NOT_FOUND crash in updater_integration.exe is
+      # root-caused): dumps the exact unresolved import that's crashing the
+      # process at load time, which Windows never surfaces in stdout/stderr.
+      - name: Set up MSVC dev environment (diagnostic)
+        if: matrix.platform == 'windows-latest'
+        uses: ilammy/msvc-dev-cmd@460a772e4cf7358f9f2f23773240813e40e7a894
+
+      - name: Build test binaries without running (diagnostic)
+        if: matrix.platform == 'windows-latest'
+        working-directory: src-tauri
+        run: cargo test --no-run --verbose
+
+      - name: Dump imports of the crashing test binary (diagnostic)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path src-tauri\target\debug\deps -Filter "updater_integration-*.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          Write-Host "Inspecting: $($exe.FullName)"
+          dumpbin /imports $exe.FullName
+
       - name: cargo test
         working-directory: src-tauri
         run: cargo test --verbose
