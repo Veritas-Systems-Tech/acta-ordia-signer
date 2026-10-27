@@ -113,17 +113,15 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: src-tauri
-          # Linux: retrying AppImage here (previously dropped after 3 targeted
-          # fixes — libfuse2, APPIMAGE_EXTRACT_AND_RUN=1, relaxing AppArmor's
-          # unprivileged-userns restriction — all failed identically with
-          # "failed to run linuxdeploy", with tauri-bundler never surfacing
-          # the real underlying error). A clean local build on a fresh Ubuntu
-          # machine with the same deps just succeeded without any of those
-          # workarounds, so this is a real retry on the actual CI runner to
-          # get a definitive answer, not a blind guess. .deb/.rpm stay either
-          # way (still the install method most Linux users expect). If
-          # AppImage builds here, Linux gets self-update too (Tauri's
-          # auto-updater only supports AppImage on Linux).
+          # Linux: AppImage + .deb + .rpm. AppImage previously failed here
+          # with "failed to run linuxdeploy" (tauri-bundler never surfaced
+          # the real cause, and 3 targeted workarounds didn't help) — retried
+          # on this exact runner on 2026-10-27 and it built clean with no
+          # changes needed, so whatever broke it before is gone now
+          # (verified on the real v0.1.2 release run, not just locally).
+          # .deb/.rpm stay too, since most Linux users expect a native
+          # package regardless — but AppImage is what gives Linux self-update
+          # (Tauri's auto-updater only supports AppImage on Linux).
           args: ${{ matrix.platform == 'ubuntu-latest' && '--bundles deb,rpm,appimage' || '' }}
           tagName: staging-${{ github.ref_name }}
           releaseName: 'Internal staging — ${{ github.ref_name }} (not for end users)'
