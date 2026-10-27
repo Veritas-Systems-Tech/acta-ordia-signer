@@ -27,7 +27,18 @@ jobs:
         with:
           fetch-depth: 0
 
+      # gitleaks/gitleaks-action requires a paid GITLEAKS_LICENSE once a repo
+      # lives under an organization (free only for personal-account repos) —
+      # broke silently when this repo moved orgs. The underlying `gitleaks`
+      # CLI itself is MIT-licensed and free regardless; this runs it directly
+      # instead of the Action wrapper, so scanning stays free and self-hosted.
+      - name: Install gitleaks CLI
+        run: |
+          curl -sSL -o gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
       - name: Run gitleaks
-        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gitleaks detect --source . --no-banner --redact
