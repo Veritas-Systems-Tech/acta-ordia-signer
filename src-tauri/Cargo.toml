@@ -54,14 +54,32 @@ ed25519-dalek = "2"
 # into real end-user machines (no real ICP-Brasil cert has been tested
 # against this build yet — see pending-user-actions memory).
 sentry = { version = "0.35", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
+# Pins the transitive `uuid` dep (pulled in by tauri-utils/infer/cfb) to the
+# last release whose own getrandom requirement is ^0.3 (1.21.0+ moved to
+# ^0.4). Without this, the resolver links getrandom 0.2 (via rand/ring),
+# 0.3 (direct + tauri's own dep) AND 0.4 (via uuid >=1.21) into the same
+# binary. getrandom 0.3 and 0.4's Windows backends both raw-dylib-import
+# `ProcessPrng` from bcryptprimitives.dll — two independent declarations of
+# that same raw-dylib import in one binary is what crashed
+# updater_integration.exe with STATUS_ENTRYPOINT_NOT_FOUND on the real
+# windows-latest CI runner (confirmed directly from the job log, not
+# guessed — this only surfaced once that test started exercising
+# tauri-plugin-updater's download() path, the first code path that actually
+# links getrandom 0.4's object code rather than leaving it dead in
+# Cargo.lock). getrandom 0.2+0.3 alone already coexist fine — the
+# pre-existing 51-test unit binary links both and passes on the same runner.
+uuid = "=1.20.0"
+# Same reasoning: tempfile 3.25.0+ widened its own getrandom requirement to
+# ">=0.3.0, <0.5", so even with uuid pinned above, the resolver was still
+# free to pick getrandom 0.4.3 to satisfy tauri-plugin-updater's tempfile
+# dep. 3.24.0 is the last release with a strict "^0.3.0" requirement, which
+# leaves the resolver no choice but the 0.3 bracket.
+tempfile = "=3.24.0"
 
 [dev-dependencies]
 url = "2"
-# BLAKE2b-512 prehash for tests/updater_integration.rs's own minisign-format
-# signer (see that file's `test_minisign` module for why it's hand-rolled
-# instead of using the `minisign` crate: that crate pulls getrandom 0.4,
-# whose Windows backend hit STATUS_ENTRYPOINT_NOT_FOUND on the real
-# windows-latest CI runner — a real, reproduced failure, not a guess).
+# BLAKE2b-512 prehash for tests/updater_integration.rs's own hand-rolled
+# minisign-format signer (see that file's `test_minisign` module).
 blake2 = "0.10"
 # Feature unification pulls this into the main `tauri` dep too, but only for
 # test builds (cargo only enables "test" when actually running tests) — it
