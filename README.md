@@ -203,12 +203,17 @@ is the digest-signing step in `functions/src/signing/prepare-digest.ts` — the
   "unknown publisher" warning on first install); the update *channel*
   itself is still cryptographically verified regardless — see "Trust
   model" below.
-- **Automated install → update → verify test in CI** — the full cycle
-  (install an old build, publish a new one, confirm a real client detects
-  it, verifies the signature, and updates in place) has been run and
-  confirmed working manually, but there's no automated test exercising it
-  on every release yet. Right now a regression in the update path would
-  only be caught by another manual pass.
+- **Automated OS-level install → update test in CI** — `tests/updater_integration.rs`
+  now runs tauri-plugin-updater's real manifest-parsing and Ed25519
+  signature-verification path on every `cargo test` run (headless, no GUI,
+  no real window — see `tauri::test::mock_app`), and specifically proves a
+  tampered artifact or a release signed by the wrong key is rejected, not
+  silently installed. What it still doesn't cover: the actual OS-level
+  binary swap (`Update::install`) — that's been verified manually once (see
+  Trust model below) but isn't automated, since doing so would mean
+  installing real binaries and restarting a process inside a CI job, which
+  is a materially different (and much more OS-specific) problem than the
+  crypto path.
 
 ## Trust model
 
