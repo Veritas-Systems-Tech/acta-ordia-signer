@@ -18,44 +18,99 @@
 
 use std::sync::{Arc, Mutex};
 
-use base64::Engine;
 use tauri_plugin_updater::UpdaterExt;
 use tiny_http::{Header, Response, Server};
 
-/// A throwaway minisign keypair generated fresh for this test run. Never the
-/// real `TAURI_SIGNING_PRIVATE_KEY` — this never signs anything that leaves
-/// the test process.
-struct TestKeyPair {
-    inner: minisign::KeyPair,
-}
+/// Hand-rolled minisign-format signing, matching exactly what
+/// `tauri-plugin-updater` verifies via the `minisign-verify` crate
+/// (confirmed against that crate's source: `PublicKey`/`Signature::decode`
+/// in minisign-verify 0.3.0).
+///
+/// Deliberately NOT using the `minisign` crate (the natural choice for
+/// "produce a minisign signature"): it pulls in `getrandom` 0.4, whose
+/// Windows backend hit `STATUS_ENTRYPOINT_NOT_FOUND` on the real
+/// `windows-latest` CI runner — reproduced, not a guess (see the CI run
+/// this test was first added in). This module only uses deps already
+/// proven to work cross-platform in this exact project: `ed25519-dalek`,
+/// `getrandom` 0.3 (both already direct dependencies, used by
+/// `server.rs`), and `blake2` (pure-Rust, no OS-specific backend).
+mod test_minisign {
+    use base64::Engine;
+    use blake2::{Blake2b512, Digest};
+    use ed25519_dalek::{Signer, SigningKey};
 
-impl TestKeyPair {
-    fn generate() -> Self {
-        Self {
-            inner: minisign::KeyPair::generate_unencrypted_keypair()
-                .expect("failed to generate test minisign keypair"),
+    pub struct TestKeyPair {
+        signing_key: SigningKey,
+        /// minisign's 8-byte key identifier. Only needs to match between the
+        /// pubkey and the signature it verifies against — minisign-verify
+        /// rejects a mismatch (`Error::UnexpectedKeyId`), but otherwise
+        /// doesn't care what the value is.
+        keynum: [u8; 8],
+    }
+
+    impl TestKeyPair {
+        pub fn generate() -> Self {
+            let mut seed = [0u8; 32];
+            getrandom::fill(&mut seed).expect("getrandom failed");
+            let mut keynum = [0u8; 8];
+            getrandom::fill(&mut keynum).expect("getrandom failed");
+            Self {
+                signing_key: SigningKey::from_bytes(&seed),
+                keynum,
+            }
+        }
+
+        /// Same shape as `tauri.conf.json`'s `plugins.updater.pubkey` field:
+        /// base64 of a 2-line minisign public-key file. Algorithm marker
+        /// "Ed" (legacy/non-prehashed marker) is used here purely as the
+        /// public key's own tag — minisign-verify accepts either marker on
+        /// the *key* itself (it only distinguishes prehashed vs. not on the
+        /// *signature*).
+        pub fn pubkey_b64(&self) -> String {
+            let verifying = self.signing_key.verifying_key();
+            let mut raw = Vec::with_capacity(42);
+            raw.extend_from_slice(b"Ed");
+            raw.extend_from_slice(&self.keynum);
+            raw.extend_from_slice(verifying.as_bytes());
+
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
+            let text = format!("untrusted comment: test minisign public key\n{b64}\n");
+            base64::engine::general_purpose::STANDARD.encode(text)
+        }
+
+        /// Same shape as a release manifest's `platforms.<target>.signature`
+        /// field: base64 of a 4-line minisign signature file, pre-hashed
+        /// mode (algorithm marker "ED", the default in real minisign and
+        /// what `release.yml`'s real releases produce).
+        pub fn sign_b64(&self, data: &[u8]) -> String {
+            let mut hasher = Blake2b512::new();
+            hasher.update(data);
+            let prehash = hasher.finalize();
+
+            let sig_bytes = self.signing_key.sign(&prehash).to_bytes();
+
+            let mut sig_line = Vec::with_capacity(74);
+            sig_line.extend_from_slice(b"ED");
+            sig_line.extend_from_slice(&self.keynum);
+            sig_line.extend_from_slice(&sig_bytes);
+            let sig_b64 = base64::engine::general_purpose::STANDARD.encode(&sig_line);
+
+            let trusted_comment = "test fixture, never a real release";
+            let mut global_input = Vec::with_capacity(sig_bytes.len() + trusted_comment.len());
+            global_input.extend_from_slice(&sig_bytes);
+            global_input.extend_from_slice(trusted_comment.as_bytes());
+            let global_sig = self.signing_key.sign(&global_input).to_bytes();
+            let global_sig_b64 = base64::engine::general_purpose::STANDARD.encode(global_sig);
+
+            let text = format!(
+                "untrusted comment: test fixture signature\n{sig_b64}\ntrusted comment: {trusted_comment}\n{global_sig_b64}\n"
+            );
+            base64::engine::general_purpose::STANDARD.encode(text)
         }
     }
-
-    /// Same shape as `tauri.conf.json`'s `plugins.updater.pubkey` field.
-    fn pubkey_b64(&self) -> String {
-        let pk_box_text = self.inner.pk.to_box().unwrap().into_string();
-        base64::engine::general_purpose::STANDARD.encode(pk_box_text)
-    }
-
-    /// Same shape as a release manifest's `platforms.<target>.signature` field.
-    fn sign_b64(&self, data: &[u8]) -> String {
-        let sig_box = minisign::sign(
-            Some(&self.inner.pk),
-            &self.inner.sk,
-            data,
-            Some("test fixture — never a real release"),
-            None,
-        )
-        .expect("failed to sign test fixture");
-        base64::engine::general_purpose::STANDARD.encode(sig_box.into_string())
-    }
 }
+
+use test_minisign::TestKeyPair;
 
 /// A local stand-in for the real update bucket (`gs://acta-ordia-signer-downloads`):
 /// serves whatever manifest/artifact bytes are currently set at

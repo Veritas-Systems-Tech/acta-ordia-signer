@@ -56,13 +56,13 @@ ed25519-dalek = "2"
 sentry = { version = "0.35", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
 
 [dev-dependencies]
-# Signs fake update manifests/artifacts in the updater integration test
-# (tests/updater_integration.rs) with real minisign-format signatures, so
-# the test exercises tauri-plugin-updater's actual Ed25519 verification
-# path (minisign-verify) rather than a stand-in. Test-only keypairs are
-# generated fresh per test run — never the real TAURI_SIGNING_PRIVATE_KEY.
-minisign = "0.10"
 url = "2"
+# BLAKE2b-512 prehash for tests/updater_integration.rs's own minisign-format
+# signer (see that file's `test_minisign` module for why it's hand-rolled
+# instead of using the `minisign` crate: that crate pulls getrandom 0.4,
+# whose Windows backend hit STATUS_ENTRYPOINT_NOT_FOUND on the real
+# windows-latest CI runner — a real, reproduced failure, not a guess).
+blake2 = "0.10"
 # Feature unification pulls this into the main `tauri` dep too, but only for
 # test builds (cargo only enables "test" when actually running tests) — it
 # gates `tauri::test::{mock_builder, mock_app, ...}`, used by
