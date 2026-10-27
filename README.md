@@ -32,18 +32,23 @@ revealed to the backend *before* a digest can even exist. Full flow:
 2. Backend's `preparePkiSigningRequest` callable freezes the document,
    creates a signing session, and mints a short-lived HMAC token.
 3. Web app calls this agent's `POST /prepare` with the session info. Agent:
-   - shows a confirmation dialog ("Acta Ordia is requesting your signature
-     for *acta title*. Continue?" — the title is sanitized: length-capped
-     and stripped of control/bidi-override characters before display),
    - opens a native file picker filtered to `.p12`/`.pfx` (**A1 first** — A3
      hardware token / PKCS#11 support is deferred, see
      `phase-2b-icp-brasil-signing-plan.md` in the main repo),
    - opens a small local window (`dist/passphrase.html`) to collect the
      certificate password — no cross-platform native password dialog
      exists, so this is a minimal webview form instead,
-   - parses the `.p12`, stashes the unlocked private key **in memory only**,
-     keyed by `session_id`, for ~15 minutes (matches the backend session
-     TTL — see `src-tauri/src/state.rs`),
+   - parses the `.p12` and extracts the certificate's subject (its CN, in
+     ICP-Brasil's `"Name:CPF"`/`"Name:CNPJ"` format),
+   - **only then** shows a single confirmation dialog — deliberately placed
+     after the certificate is already known, so it can show *which identity*
+     is about to sign, not just the acta title ("Acta Ordia is requesting
+     your signature for *acta title*, using the certificate for: *Name:CPF*.
+     Continue?" — the title is sanitized: length-capped and stripped of
+     control/bidi-override characters before display),
+   - stashes the unlocked private key **in memory only**, keyed by
+     `session_id`, for ~15 minutes (matches the backend session TTL — see
+     `src-tauri/src/state.rs`),
    - returns the **public certificate chain** plus a freshly generated
      256-bit random `agent_token` (OS CSPRNG) to the web app — the
      per-session shared secret that `/sign` will require back.
@@ -198,6 +203,12 @@ is the digest-signing step in `functions/src/signing/prepare-digest.ts` — the
   "unknown publisher" warning on first install); the update *channel*
   itself is still cryptographically verified regardless — see "Trust
   model" below.
+- **Automated install → update → verify test in CI** — the full cycle
+  (install an old build, publish a new one, confirm a real client detects
+  it, verifies the signature, and updates in place) has been run and
+  confirmed working manually, but there's no automated test exercising it
+  on every release yet. Right now a regression in the update path would
+  only be caught by another manual pass.
 
 ## Trust model
 
