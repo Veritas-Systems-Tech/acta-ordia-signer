@@ -193,7 +193,7 @@ same as correct at runtime against real inputs:**
 1. **Compiles** — `cargo build` succeeding only proves the code is
    well-typed against the installed crate versions. True on all 3
    platforms (both locally for Linux, and via CI for all three).
-2. **Automated tests pass, in CI, on all 3 platforms** — `cargo test`'s 55
+2. **Automated tests pass, in CI, on all 3 platforms** — `cargo test`'s 56
    tests (52 unit + 4 integration, see above) and `cargo clippy` run on
    every push on Linux, macOS, *and* Windows (`.github/workflows/test.yml`).
    The `tests/updater_integration.rs` suite specifically exercises

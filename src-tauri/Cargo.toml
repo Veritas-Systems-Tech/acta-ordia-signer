@@ -4,7 +4,7 @@ version = "0.1.2"
 description = "Acta Ordia ICP-Brasil signing agent — signs the CMS digest locally, private key never leaves this process"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/VeritasSystems/acta-ordia-signer"
+repository = "https://github.com/Veritas-Systems-Tech/acta-ordia-signer"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
