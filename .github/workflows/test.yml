@@ -65,25 +65,32 @@ jobs:
         working-directory: src-tauri
         run: cargo build --verbose
 
-      # TEMPORARY diagnostic: a bare tauri::test mock app (no plugins, no
-      # updater) ALSO crashes with STATUS_ENTRYPOINT_NOT_FOUND — meaning
-      # this might not be a test-only problem. Check whether the actual
-      # shipped main binary crashes the same way when run for real on
-      # Windows (launch it, give it a few seconds, then kill it — if it's
-      # still alive after that, it started successfully).
-      - name: Check whether the real app binary itself starts on Windows (diagnostic)
+      # TEMPORARY diagnostic: the real app binary starts fine (confirmed in
+      # a previous run). Theory: the main binary gets a Comctl32-v6
+      # application manifest embedded (via tauri-build/tauri-winres) that a
+      # separate `cargo test` integration-test binary target never gets —
+      # and the crashing test binary's own dumpbin output shows it imports
+      # SetWindowSubclass/DefSubclassProc, which require Comctl32 v6 by
+      # manifest or STATUS_ENTRYPOINT_NOT_FOUND is exactly what you get.
+      # Check for an embedded manifest (plain XML text resource) in both
+      # binaries to confirm or kill that theory directly.
+      - name: Check for an embedded Windows manifest in both binaries (diagnostic)
         if: matrix.platform == 'windows-latest'
+        working-directory: src-tauri
         shell: pwsh
         run: |
-          $exe = "src-tauri\target\debug\acta-ordia-signer.exe"
-          Write-Host "Launching: $exe"
-          $p = Start-Process -FilePath $exe -PassThru
-          Start-Sleep -Seconds 5
-          if ($p.HasExited) {
-            Write-Host "Process EXITED early with code: $($p.ExitCode) (as unsigned: $('0x{0:X8}' -f [uint32]$p.ExitCode))"
-          } else {
-            Write-Host "Process is still running after 5s — it started successfully. Killing it."
-            Stop-Process -Id $p.Id -Force
+          cargo test --no-run --verbose
+          $testExe = Get-ChildItem -Path target\debug\deps -Filter "updater_integration-*.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          $mainExe = "target\debug\acta-ordia-signer.exe"
+          foreach ($f in @($mainExe, $testExe.FullName)) {
+            Write-Host "--- $f ---"
+            $hit = Select-String -Path $f -Pattern "<assembly" -Encoding ascii -ErrorAction SilentlyContinue
+            if ($hit) {
+              Write-Host "HAS an embedded manifest (found '<assembly' text)"
+              Select-String -Path $f -Pattern "requestedExecutionLevel|comctl32|6595b64144ccf1df" -Encoding ascii -ErrorAction SilentlyContinue
+            } else {
+              Write-Host "NO embedded manifest found"
+            }
           }
 
       - name: cargo test
