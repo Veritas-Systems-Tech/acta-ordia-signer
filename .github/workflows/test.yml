@@ -65,6 +65,27 @@ jobs:
         working-directory: src-tauri
         run: cargo build --verbose
 
+      # TEMPORARY diagnostic: a bare tauri::test mock app (no plugins, no
+      # updater) ALSO crashes with STATUS_ENTRYPOINT_NOT_FOUND — meaning
+      # this might not be a test-only problem. Check whether the actual
+      # shipped main binary crashes the same way when run for real on
+      # Windows (launch it, give it a few seconds, then kill it — if it's
+      # still alive after that, it started successfully).
+      - name: Check whether the real app binary itself starts on Windows (diagnostic)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $exe = "src-tauri\target\debug\acta-ordia-signer.exe"
+          Write-Host "Launching: $exe"
+          $p = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 5
+          if ($p.HasExited) {
+            Write-Host "Process EXITED early with code: $($p.ExitCode) (as unsigned: $('0x{0:X8}' -f [uint32]$p.ExitCode))"
+          } else {
+            Write-Host "Process is still running after 5s — it started successfully. Killing it."
+            Stop-Process -Id $p.Id -Force
+          }
+
       - name: cargo test
         working-directory: src-tauri
         run: cargo test --verbose
