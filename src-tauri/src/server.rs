@@ -332,15 +332,19 @@ fn handle_prepare(app: &AppHandle, body: &str) -> tiny_http::ResponseBox {
         return json_response(&ErrorResponse::new("invalid_certificate", "The .p12 file has no certificate/key pair."), 422);
     };
 
-    let subject_cn = subject_common_name(&cert).unwrap_or_default();
+    // Sanitized immediately, before it's used anywhere: a .p12's CN is
+    // fully attacker-controlled (anyone can mint a self-signed cert with
+    // any CN string, including bidi-override/zero-width tricks), unlike
+    // the comment this replaced assumed. It's the one line whose whole job
+    // is letting the user confirm WHOSE identity is about to sign, so it
+    // gets the same treatment as acta_title.
+    let subject_cn = sanitize_title(&subject_common_name(&cert).unwrap_or_default());
 
     // Confirmation happens here, after the certificate is parsed, so the
     // dialog can show WHICH identity (ICP-Brasil CN encodes "Name:CPF" or
     // "Name:CNPJ") is about to sign, not just the acta title. Showing the
     // title alone — the original order — let a user approve a signature
-    // without ever seeing whose certificate it would carry; sanitize_title
-    // covers the attacker-influenced half of this string, subject_cn comes
-    // from the certificate itself so it isn't spoofable the same way.
+    // without ever seeing whose certificate it would carry.
     let (confirm_tx, confirm_rx) = mpsc::channel();
     let dialog_subject = if subject_cn.is_empty() { "unknown subject".to_string() } else { subject_cn.clone() };
     app.dialog()
@@ -966,6 +970,37 @@ mod tests {
         let cert = builder.build();
 
         assert_eq!(subject_common_name(&cert), Some("Test Signer:12345678901".to_string()));
+    }
+
+    #[test]
+    fn subject_cn_from_a_malicious_certificate_is_sanitized_before_display() {
+        // Regression test for a real finding: a .p12's CN is fully
+        // attacker-controlled (anyone can mint a self-signed cert with any
+        // CN string), so handle_prepare must sanitize it the same way it
+        // sanitizes acta_title before putting it in the confirm dialog or
+        // the PrepareResponse — this confirms subject_common_name's raw
+        // output, piped through sanitize_title (what handle_prepare now
+        // does), strips the same spoofing tricks acta_title is protected
+        // against.
+        let (pkey, _rsa) = test_keypair();
+        let mut builder = X509::builder().expect("builder");
+        builder.set_pubkey(&pkey).expect("set pubkey");
+        let mut name_builder = openssl::x509::X509NameBuilder::new().expect("name builder");
+        let evil_cn = "Jo\u{202E}nhoD\u{200B}e\u{FEFF}";
+        name_builder.append_entry_by_nid(openssl::nid::Nid::COMMONNAME, evil_cn).expect("append CN");
+        let name = name_builder.build();
+        builder.set_subject_name(&name).expect("set subject");
+        builder.set_issuer_name(&name).expect("set issuer");
+        builder.sign(&pkey, MessageDigest::sha256()).expect("self-sign");
+        let cert = builder.build();
+
+        let raw_cn = subject_common_name(&cert).expect("CN should be present");
+        assert_eq!(raw_cn, evil_cn, "sanity check: the raw CN really does carry the attack chars");
+
+        let sanitized = sanitize_title(&raw_cn);
+        for forbidden in ['\u{202E}', '\u{200B}', '\u{FEFF}'] {
+            assert!(!sanitized.contains(forbidden), "forbidden char {forbidden:?} leaked through sanitization: {sanitized:?}");
+        }
     }
 
     #[test]
