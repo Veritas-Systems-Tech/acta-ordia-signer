@@ -14,16 +14,17 @@
 #    which builds the native bundle for that OS AND signs it with the
 #    updater's private key (via TAURI_SIGNING_PRIVATE_KEY[_PASSWORD]).
 #    It publishes those signed bundles to a temporary, unlisted GitHub
-#    Release in THIS PRIVATE REPO — used purely as a well-tested way to get
-#    tauri-action's own correctly-generated updater manifest fragment
+#    Release in this repo, deleted within the same job run — used purely
+#    as a well-tested way to get tauri-action's own correctly-generated
+#    updater manifest fragment
 #    (exact bundle filenames/signature format), rather than us hand-rolling
 #    that. This release is never advertised to end users and is deleted by
 #    the publish job below once its assets are mirrored elsewhere.
 #
 # 2. `publish` (needs: build, runs once after all 3 platforms finish):
 #    downloads every asset from that temporary release via the GitHub API
-#    (authenticated with GITHUB_TOKEN — works fine against our own private
-#    repo), rewrites `latest.json`'s URLs to point at our own storage
+#    (authenticated with GITHUB_TOKEN — works fine against this repo),
+#    rewrites `latest.json`'s URLs to point at our own storage
 #    instead of github.com, and uploads everything to a dedicated public
 #    Cloud Storage bucket, then deletes the temporary GitHub release + tag.
 #
@@ -42,18 +43,13 @@
 # Required GitHub Secrets (see acta-ordia-signer README for how to obtain):
 #   TAURI_SIGNING_PRIVATE_KEY          — from `cargo tauri signer generate`
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD — password for that key (may be empty)
+#   GCP_WORKLOAD_IDENTITY_PROVIDER     — full WIF provider resource path
+#   GCP_SERVICE_ACCOUNT                — email of the deploying service account
 #
-# Required one-time GCP setup (same acta-ordia project the main app uses):
-#   `gcloud storage buckets create gs://acta-ordia-signer-downloads
-#      --project=acta-ordia --location=us-central1 --uniform-bucket-level-access`
-#   then grant public read: `gcloud storage buckets add-iam-policy-binding
-#      gs://acta-ordia-signer-downloads --member=allUsers --role=roles/storage.objectViewer`
-#   WIF (github-actions-pool/github-provider) and the deploying service
-#   account (firebase-adminsdk-fbsvc@acta-ordia.iam.gserviceaccount.com,
-#   already has project-wide roles/storage.admin) both already cover this
-#   repo — no additional grants needed, verified directly against the live
-#   IAM policy (provider condition is `repository_owner == 'Veritas-Systems-Tech'`,
-#   not scoped per-repo).
+# One-time GCP setup (not detailed here — internal infra, not this repo's
+# concern): a public GCS bucket for hosting signed bundles, and Workload
+# Identity Federation scoped to this org so CI can upload to it without a
+# long-lived key. The two secrets above are how that setup is wired in.
 
 name: Release
 
@@ -180,8 +176,8 @@ jobs:
       - name: Authenticate to GCP (Workload Identity Federation)
         uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed
         with:
-          workload_identity_provider: projects/66429062436/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
-          service_account: firebase-adminsdk-fbsvc@acta-ordia.iam.gserviceaccount.com
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
       - name: Set up gcloud CLI
         uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f
