@@ -61,14 +61,19 @@ jobs:
             src-tauri/target
           key: ${{ matrix.platform }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
 
+      # --locked on all three: Cargo.lock is committed for a security-
+      # sensitive binary specifically so dependency resolution is
+      # reproducible. Without --locked, a Cargo.toml/lock drift would
+      # silently re-resolve and rewrite the lock in CI instead of failing
+      # loudly.
       - name: cargo build
         working-directory: src-tauri
-        run: cargo build --verbose
+        run: cargo build --verbose --locked
 
       - name: cargo test
         working-directory: src-tauri
-        run: cargo test --verbose
+        run: cargo test --verbose --locked
 
       - name: cargo clippy
         working-directory: src-tauri
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
