@@ -86,6 +86,29 @@ jobs:
           Write-Host "Inspecting: $($exe.FullName)"
           dumpbin /imports $exe.FullName
 
+      # dumpbin parsed the import table cleanly (no corruption, no missing
+      # entries) — so the real failure must be at *load* time, not in the
+      # PE structure. Run the exe directly (ignoring its own exit code) and
+      # then pull whatever Windows Error Reporting / loader logged about it
+      # from the Application and System event logs — that's the only place
+      # STATUS_ENTRYPOINT_NOT_FOUND's actual missing DLL/export ever surfaces.
+      - name: Run the binary directly and capture WER/loader event log entries (diagnostic)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path src-tauri\target\debug\deps -Filter "updater_integration-*.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          $before = Get-Date
+          Write-Host "Running: $($exe.FullName)"
+          & $exe.FullName --test-threads=1 2>&1 | Out-String | Write-Host
+          Write-Host "Exit code: $LASTEXITCODE"
+          Start-Sleep -Seconds 3
+          Write-Host "--- Application log entries since run ---"
+          Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=$before} -ErrorAction SilentlyContinue |
+            Format-List TimeCreated, ProviderName, Id, LevelDisplayName, Message
+          Write-Host "--- System log entries since run ---"
+          Get-WinEvent -FilterHashtable @{LogName='System'; StartTime=$before} -ErrorAction SilentlyContinue |
+            Format-List TimeCreated, ProviderName, Id, LevelDisplayName, Message
+
       - name: cargo test
         working-directory: src-tauri
         run: cargo test --verbose
