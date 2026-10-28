@@ -106,17 +106,19 @@ While `npm run dev` is running:
 
 ```bash
 curl http://127.0.0.1:7734/health
-# {"status":"ok","version":"0.1.1"}
+# {"status":"ok","version":"0.1.2"}
 ```
 
 ## Verified against real compiler output (2026-07-18, re-verified 2026-07-20, 2026-10-27)
 
-`cargo build`, `cargo check --release`, `cargo test` (55/55 — 51 unit tests
-across `main.rs`, `passphrase.rs`, `state.rs`, `server.rs`, `protocol.rs`,
-plus 4 integration tests in `tests/updater_integration.rs`), and `cargo
-clippy --all-targets -- -D warnings` (zero warnings) all pass — and, since
-2026-10-27, pass on **all three target platforms** (Linux, macOS, Windows),
-automatically, on every push, via `.github/workflows/test.yml`. Locally
+`cargo build`, `cargo test` (56/56 — 52 unit tests across `main.rs`,
+`passphrase.rs`, `state.rs`, `server.rs`, `protocol.rs`, plus 4 integration
+tests in `tests/updater_integration.rs`), and `cargo clippy --all-targets --
+-D warnings` (zero warnings) all pass — and, since 2026-10-27, pass on
+**all three target platforms** (Linux, macOS, Windows), automatically, on
+every push, via `.github/workflows/test.yml` (`cargo check --release` was
+also run manually at the time, but isn't one of the commands CI actually
+runs). Locally
 this was first verified on Linux only, after installing `libgtk-3-dev
 libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev
 libssl-dev`. This confirms:
@@ -156,8 +158,15 @@ Applied after an adversarial audit (`SECURITY_AUDIT_2026-07-20.md`):
   `/prepare` and `/sign` simply reads the token out of the `/prepare` response.
   It is kept as a cheap secondary session-binding convenience, but the Ed25519
   check above is the primary defense.
-- **`acta_title` sanitized** before the OS confirm dialog: control and
-  bidi-override/invisible characters stripped, length capped at 120 chars.
+- **`acta_title` and the certificate's subject CN both sanitized** before
+  the OS confirm dialog (and before the CN goes out in `/prepare`'s
+  response): control and bidi-override/invisible characters stripped,
+  length capped at 120 chars. The CN sanitization was added later
+  (2026-10-28, audit finding) — a `.p12`'s CN is fully attacker-controlled
+  (anyone can mint a self-signed cert with any CN string), so the
+  original code's assumption that only `acta_title` needed this
+  protection was wrong; the one line whose whole job is letting the user
+  confirm *whose identity* is about to sign was spoofable the same way.
 - **Passphrase and raw `.p12` bytes wrapped in `zeroize::Zeroizing`**
   (finding 2) — scrubbed from heap memory on drop.
 - **App ACL manifest registered in `build.rs`** (finding 3, above).
@@ -185,7 +194,7 @@ same as correct at runtime against real inputs:**
    well-typed against the installed crate versions. True on all 3
    platforms (both locally for Linux, and via CI for all three).
 2. **Automated tests pass, in CI, on all 3 platforms** — `cargo test`'s 55
-   tests (51 unit + 4 integration, see above) and `cargo clippy` run on
+   tests (52 unit + 4 integration, see above) and `cargo clippy` run on
    every push on Linux, macOS, *and* Windows (`.github/workflows/test.yml`).
    The `tests/updater_integration.rs` suite specifically exercises
    tauri-plugin-updater's real manifest-parsing and Ed25519
