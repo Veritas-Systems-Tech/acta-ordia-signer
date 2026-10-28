@@ -109,13 +109,17 @@ curl http://127.0.0.1:7734/health
 # {"status":"ok","version":"0.1.1"}
 ```
 
-## Verified against real compiler output (2026-07-18, re-verified 2026-07-20)
+## Verified against real compiler output (2026-07-18, re-verified 2026-07-20, 2026-10-27)
 
-`cargo build`, `cargo check --release`, `cargo test` (51/51 across `main.rs`,
-`passphrase.rs`, `state.rs`, `server.rs`, `protocol.rs`), and `cargo
-clippy --all-targets -- -D warnings` (zero warnings) all pass cleanly on
-Linux, after installing `libgtk-3-dev libwebkit2gtk-4.1-dev
-libjavascriptcoregtk-4.1-dev libsoup-3.0-dev libssl-dev`. This confirms:
+`cargo build`, `cargo check --release`, `cargo test` (55/55 — 51 unit tests
+across `main.rs`, `passphrase.rs`, `state.rs`, `server.rs`, `protocol.rs`,
+plus 4 integration tests in `tests/updater_integration.rs`), and `cargo
+clippy --all-targets -- -D warnings` (zero warnings) all pass — and, since
+2026-10-27, pass on **all three target platforms** (Linux, macOS, Windows),
+automatically, on every push, via `.github/workflows/test.yml`. Locally
+this was first verified on Linux only, after installing `libgtk-3-dev
+libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev
+libssl-dev`. This confirms:
 
 - `passphrase.rs`'s use of `AppHandle::run_on_main_thread` compiles against
   the installed Tauri 2 crate version.
@@ -173,22 +177,42 @@ The web-app counterpart (`src/lib/pkiSigning.ts` +
 is the digest-signing step in `functions/src/signing/prepare-digest.ts` — the
 `agent_token` itself never transits the backend.
 
-**Still not verified — compiling is not the same as correct at runtime:**
+**Three different, easily-conflated levels of "verified" — compiling is not
+the same as automated tests passing, and automated tests passing is not the
+same as correct at runtime against real inputs:**
 
-- Never run against a real ICP-Brasil certificate or a real signing
-  session — no proof yet that `handle_prepare`/`handle_sign` actually
-  produce a signature the backend accepts.
-- `cargo tauri dev`/`cargo tauri build` (the full Tauri CLI pipeline, not
-  just `cargo build`) not yet run — bundling/packaging is untested.
-- Not tested on macOS or Windows — only Linux so far.
-- `Cargo.lock` was generated against whatever crate versions were latest as
-  of this build; hasn't been pinned/audited for a real release.
-- `cargo tauri build` (full bundle: AppImage/.deb) panics on this machine
-  with "Can't detect any appindicator library" — needs
-  `libayatana-appindicator3-dev` in addition to the headers above. Only
-  affects the bundling step; `cargo build`/`cargo build --release` and
-  `cargo tauri build --no-bundle` all work without it. CI runners for
-  `tauri-action` typically have this preinstalled.
+1. **Compiles** — `cargo build` succeeding only proves the code is
+   well-typed against the installed crate versions. True on all 3
+   platforms (both locally for Linux, and via CI for all three).
+2. **Automated tests pass, in CI, on all 3 platforms** — `cargo test`'s 55
+   tests (51 unit + 4 integration, see above) and `cargo clippy` run on
+   every push on Linux, macOS, *and* Windows (`.github/workflows/test.yml`).
+   The `tests/updater_integration.rs` suite specifically exercises
+   tauri-plugin-updater's real manifest-parsing and Ed25519
+   signature-verification path headlessly (no GUI) — see "What's not built
+   yet" below for exactly what that does and doesn't prove. Full release
+   *bundles* (AppImage/.deb/.rpm, .msi/.exe, .dmg) are also built on all 3
+   platforms by `.github/workflows/release.yml` on every tagged release
+   (confirmed working end-to-end as of `v0.1.2`), but that's an automated
+   build succeeding, not a human running the installed app.
+3. **Real functional validation — still the biggest gap:**
+   - Never run against a real ICP-Brasil certificate or a real signing
+     session — no proof yet that `handle_prepare`/`handle_sign` actually
+     produce a signature the backend accepts.
+   - No GUI click-through E2E test confirmed on macOS or Windows (one was
+     done on Linux — see the E2E testing notes in project history). CI
+     proves the binaries build and the headless crypto/logic tests pass
+     on all 3 OSes; it does not click through the actual file picker,
+     confirm dialog, or passphrase window on macOS/Windows.
+   - `Cargo.lock` was generated against whatever crate versions were latest
+     as of this build; hasn't been pinned/audited for a real release.
+   - Locally on Linux, `cargo tauri build` (full bundle: AppImage/.deb)
+     panics with "Can't detect any appindicator library" unless
+     `libayatana-appindicator3-dev` is also installed (CI's runners already
+     have it, and `release.yml`'s real builds — including the AppImage
+     target — have succeeded there since `v0.1.2`). Only affects the local
+     bundling step; `cargo build`/`cargo build --release` and `cargo tauri
+     build --no-bundle` work without it.
 
 ## What's not built yet
 
