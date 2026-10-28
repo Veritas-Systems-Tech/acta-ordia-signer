@@ -65,34 +65,6 @@ jobs:
         working-directory: src-tauri
         run: cargo build --verbose
 
-      # TEMPORARY diagnostic: the real app binary starts fine (confirmed in
-      # a previous run). Theory: the main binary gets a Comctl32-v6
-      # application manifest embedded (via tauri-build/tauri-winres) that a
-      # separate `cargo test` integration-test binary target never gets —
-      # and the crashing test binary's own dumpbin output shows it imports
-      # SetWindowSubclass/DefSubclassProc, which require Comctl32 v6 by
-      # manifest or STATUS_ENTRYPOINT_NOT_FOUND is exactly what you get.
-      # Check for an embedded manifest (plain XML text resource) in both
-      # binaries to confirm or kill that theory directly.
-      - name: Check for an embedded Windows manifest in both binaries (diagnostic)
-        if: matrix.platform == 'windows-latest'
-        working-directory: src-tauri
-        shell: pwsh
-        run: |
-          cargo test --no-run --verbose
-          $testExe = Get-ChildItem -Path target\debug\deps -Filter "updater_integration-*.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          $mainExe = "target\debug\acta-ordia-signer.exe"
-          foreach ($f in @($mainExe, $testExe.FullName)) {
-            Write-Host "--- $f ---"
-            $hit = Select-String -Path $f -Pattern "<assembly" -Encoding ascii -ErrorAction SilentlyContinue
-            if ($hit) {
-              Write-Host "HAS an embedded manifest (found '<assembly' text)"
-              Select-String -Path $f -Pattern "requestedExecutionLevel|comctl32|6595b64144ccf1df" -Encoding ascii -ErrorAction SilentlyContinue
-            } else {
-              Write-Host "NO embedded manifest found"
-            }
-          }
-
       - name: cargo test
         working-directory: src-tauri
         run: cargo test --verbose
