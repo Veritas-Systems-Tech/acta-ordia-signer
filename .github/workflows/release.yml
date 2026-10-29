@@ -48,8 +48,12 @@
 #
 # One-time GCP setup (not detailed here — internal infra, not this repo's
 # concern): a public GCS bucket for hosting signed bundles, and Workload
-# Identity Federation scoped to this org so CI can upload to it without a
-# long-lived key. The two secrets above are how that setup is wired in.
+# Identity Federation so CI can upload to it without a long-lived key.
+# GCP_SERVICE_ACCOUNT is a dedicated account scoped to only this repo
+# (via the WIF principal) and only object-admin on that one bucket —
+# deliberately not a shared, broader-permission account, since this
+# workflow runs in a public repo. The two secrets above are how that
+# setup is wired in.
 
 name: Release
 
