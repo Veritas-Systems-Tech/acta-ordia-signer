@@ -1,6 +1,6 @@
 {
   "name": "acta-ordia-signer",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "private": true,
   "description": "Acta Ordia ICP-Brasil signing agent (Tauri) — signs the CMS digest locally, private key never leaves this process",
   "scripts": {

@@ -109,11 +109,12 @@ curl http://127.0.0.1:7734/health
 # {"status":"ok","version":"0.1.2"}
 ```
 
-## Verified against real compiler output (2026-07-18, re-verified 2026-07-20, 2026-10-27)
+## Verified against real compiler output (2026-07-18, re-verified 2026-07-20, 2026-10-27, 2026-10-29)
 
-`cargo build`, `cargo test` (56/56 — 52 unit tests across `main.rs`,
-`passphrase.rs`, `state.rs`, `server.rs`, `protocol.rs`, plus 4 integration
-tests in `tests/updater_integration.rs`), and `cargo clippy --all-targets --
+`cargo build`, `cargo test` (62/62 — 58 unit tests across `main.rs`,
+`passphrase.rs`, `state.rs`, `server.rs`, `protocol.rs`, `activity.rs`,
+`mutex_ext.rs`, plus 4 integration tests in `tests/updater_integration.rs`),
+and `cargo clippy --all-targets --
 -D warnings` (zero warnings) all pass — and, since 2026-10-27, pass on
 **all three target platforms** (Linux, macOS, Windows), automatically, on
 every push, via `.github/workflows/test.yml` (`cargo check --release` was
@@ -193,8 +194,8 @@ same as correct at runtime against real inputs:**
 1. **Compiles** — `cargo build` succeeding only proves the code is
    well-typed against the installed crate versions. True on all 3
    platforms (both locally for Linux, and via CI for all three).
-2. **Automated tests pass, in CI, on all 3 platforms** — `cargo test`'s 56
-   tests (52 unit + 4 integration, see above) and `cargo clippy` run on
+2. **Automated tests pass, in CI, on all 3 platforms** — `cargo test`'s 62
+   tests (58 unit + 4 integration, see above) and `cargo clippy` run on
    every push on Linux, macOS, *and* Windows (`.github/workflows/test.yml`).
    The `tests/updater_integration.rs` suite specifically exercises
    tauri-plugin-updater's real manifest-parsing and Ed25519

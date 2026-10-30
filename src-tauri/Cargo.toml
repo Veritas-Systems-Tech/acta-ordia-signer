@@ -1,6 +1,6 @@
 [package]
 name = "acta-ordia-signer"
-version = "0.1.2"
+version = "0.2.0"
 description = "Acta Ordia ICP-Brasil signing agent — signs the CMS digest locally, private key never leaves this process"
 edition = "2021"
 license = "MIT"
@@ -14,6 +14,13 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-updater = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-dialog = "2"
+# Launch-on-login (ADR pending, same session as the updater wiring below) —
+# default-on, with a tray-menu toggle to opt out. User-confirmed default.
+tauri-plugin-autostart = "2"
+# Native OS notification for the one-time first-run acknowledgment — this
+# app shows no window on launch (tray-only by design), so without this a
+# brand-new user has zero confirmation anything happened.
+tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tiny_http = "0.12"

@@ -1,20 +1,127 @@
 // Prevents an additional console window on Windows in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod activity;
+mod mutex_ext;
 mod passphrase;
+mod picker_memory;
 mod protocol;
 mod server;
 mod state;
+mod status_window;
 mod telemetry;
 
 use tauri::{
-    menu::{Menu, MenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem},
     tray::TrayIconBuilder,
     Manager,
 };
+use tauri_plugin_autostart::{ManagerExt as AutostartManagerExt, MacosLauncher};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use tauri_plugin_notification::NotificationExt;
+use tauri_plugin_updater::UpdaterExt;
 
+use activity::SignerActivity;
 use passphrase::{cancel_passphrase, submit_passphrase, PassphraseChannel};
 use state::SigningState;
+
+const FIRST_RUN_MARKER: &str = ".first_run_complete";
+
+/// `true` the very first time this is ever called on this machine (the
+/// marker file didn't exist yet and was just created), `false` on every
+/// later launch. Best-effort in the safe direction: any filesystem error
+/// (can't read the app-data dir, can't write the marker) reads as "not
+/// first run" — worst case a weird filesystem skips the one-time autostart
+/// default and welcome notification, never repeats them indefinitely.
+fn mark_first_run_if_new(app: &tauri::AppHandle) -> bool {
+    let Ok(dir) = app.path().app_local_data_dir() else { return false };
+    let marker = dir.join(FIRST_RUN_MARKER);
+    if marker.exists() {
+        return false;
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(&marker, b"").is_ok()
+}
+
+/// Exits immediately if nothing is in flight. Otherwise asks first — gated
+/// on `SignerActivity`'s dedicated in-flight counter, NOT `SigningState`'s
+/// sessions map (that holds a prepared-but-unsigned session for its full
+/// 15-minute TTL, which would warn on an ordinary quit long after the user
+/// forgot about an abandoned signature — see activity.rs's module doc).
+fn request_quit(app: &tauri::AppHandle) {
+    let in_flight = app.state::<SignerActivity>().in_flight_count();
+    if in_flight == 0 {
+        app.exit(0);
+        return;
+    }
+    let app_for_confirm = app.clone();
+    app.dialog()
+        .message(format!(
+            "A signature is currently being processed ({in_flight} request{} in flight). Quit anyway?",
+            if in_flight == 1 { "" } else { "s" }
+        ))
+        .title("Quit Acta Ordia Signer")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancel)
+        .show(move |confirmed| {
+            if confirmed {
+                app_for_confirm.exit(0);
+            }
+        });
+}
+
+/// Flips autostart and keeps the tray checkbox's visual state in sync —
+/// `AutoLaunchManager::enable`/`disable` don't touch the menu item
+/// themselves, and there's no `app.menu()` accessor to re-fetch it later,
+/// so the item is captured by the caller and passed in directly.
+fn toggle_autostart(app: &tauri::AppHandle, item: &CheckMenuItem<tauri::Wry>) {
+    let Ok(enabled) = app.autolaunch().is_enabled() else { return };
+    let result = if enabled { app.autolaunch().disable() } else { app.autolaunch().enable() };
+    if result.is_ok() {
+        let _ = item.set_checked(!enabled);
+    }
+}
+
+/// User-triggered check (the "Check for Updates" menu item) — unlike the
+/// silent startup check, this one always reports back, including "already
+/// up to date" and "couldn't check," and installs + restarts immediately
+/// on finding an update rather than just notifying.
+fn check_for_updates_now(app: &tauri::AppHandle) {
+    let app_for_check = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let Ok(updater) = app_for_check.updater() else { return };
+        match updater.check().await {
+            Ok(Some(update)) => {
+                if update.download_and_install(|_, _| {}, || {}).await.is_ok() {
+                    app_for_check.restart();
+                } else {
+                    let _ = app_for_check
+                        .notification()
+                        .builder()
+                        .title("Acta Ordia Signer")
+                        .body("Found an update but couldn't install it — check your internet connection and try again.")
+                        .show();
+                }
+            }
+            Ok(None) => {
+                let _ = app_for_check
+                    .notification()
+                    .builder()
+                    .title("Acta Ordia Signer")
+                    .body("You're already on the latest version.")
+                    .show();
+            }
+            Err(_) => {
+                let _ = app_for_check
+                    .notification()
+                    .builder()
+                    .title("Acta Ordia Signer")
+                    .body("Couldn't check for updates right now — check your internet connection and try again.")
+                    .show();
+            }
+        }
+    });
+}
 
 fn main() {
     // Held for the whole process lifetime (main() blocks on tauri's .run()
@@ -23,33 +130,98 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            // A second launch focuses/no-ops instead of binding the port twice.
-            let _ = app
-                .get_webview_window("main")
-                .map(|w| {
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                });
+            // A second launch opens the status popover instead of binding
+            // the port twice. (Previously referenced a "main" window that
+            // never existed — this app has never had a persistent window;
+            // `"windows": []` in tauri.conf.json, dead code until now.)
+            status_window::open_status_window(app);
         }))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))
+        .plugin(tauri_plugin_notification::init())
         .manage(SigningState::default())
         .manage(PassphraseChannel::default())
-        .invoke_handler(tauri::generate_handler![submit_passphrase, cancel_passphrase])
+        .manage(SignerActivity::default())
+        .invoke_handler(tauri::generate_handler![
+            submit_passphrase,
+            cancel_passphrase,
+            status_window::get_signer_status,
+        ])
         .setup(|app| {
             server::spawn(app.handle().clone());
 
+            // Default-on, user-confirmed: a signing tool should just be
+            // ready. Only asserted on the actual first run — never
+            // re-asserted later, so an explicit opt-out via the tray
+            // checkbox sticks across restarts.
+            if mark_first_run_if_new(app.handle()) {
+                let _ = app.autolaunch().enable();
+                let _ = app
+                    .notification()
+                    .builder()
+                    .title("Acta Ordia Signer")
+                    .body("Running in your system tray — look for the icon when you need to sign a document.")
+                    .show();
+            }
+
+            // Courtesy check only — failure (offline, endpoint down) is
+            // silent and never blocks startup. Notifies, doesn't auto-
+            // install; installing is only ever triggered by the user via
+            // the "Check for Updates" menu item below.
+            let startup_updater_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Ok(updater) = startup_updater_app.updater() {
+                    if let Ok(Some(update)) = updater.check().await {
+                        let _ = startup_updater_app
+                            .notification()
+                            .builder()
+                            .title("Acta Ordia Signer update available")
+                            .body(format!(
+                                "Version {} is available — open the tray menu and choose \"Check for Updates\" to install it.",
+                                update.version
+                            ))
+                            .show();
+                    }
+                }
+            });
+
+            let autostart_enabled = app.autolaunch().is_enabled().unwrap_or(false);
+            let status_item = MenuItem::with_id(app, "status", "Status…", true, None::<&str>)?;
+            let autostart_item =
+                CheckMenuItem::with_id(app, "autostart", "Start at login", true, autostart_enabled, None::<&str>)?;
+            let update_item = MenuItem::with_id(app, "check_updates", "Check for Updates", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit Acta Ordia Signer", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&quit_item])?;
+            let menu = Menu::with_items(app, &[&status_item, &autostart_item, &update_item, &quit_item])?;
+
+            let autostart_item_for_toggle = autostart_item.clone();
 
             TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
                 .tooltip("Acta Ordia Signer — private key never leaves this machine")
-                .on_menu_event(|app, event| {
-                    if event.id.as_ref() == "quit" {
-                        app.exit(0);
+                // Left-click opens the status popover instead of the menu
+                // on platforms that support it. Unsupported on Linux (the
+                // tray-icon crate never emits Click there — right-click
+                // still opens the menu as normal), so the "Status…" menu
+                // item above is the one path that works everywhere.
+                .show_menu_on_left_click(false)
+                .on_tray_icon_event(|tray, event| {
+                    if let tauri::tray::TrayIconEvent::Click {
+                        button: tauri::tray::MouseButton::Left,
+                        button_state: tauri::tray::MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        status_window::open_status_window(tray.app_handle());
                     }
+                })
+                .on_menu_event(move |app, event| match event.id.as_ref() {
+                    "quit" => request_quit(app),
+                    "status" => status_window::open_status_window(app),
+                    "check_updates" => check_for_updates_now(app),
+                    "autostart" => toggle_autostart(app, &autostart_item_for_toggle),
+                    _ => {}
                 })
                 .build(app)?;
 

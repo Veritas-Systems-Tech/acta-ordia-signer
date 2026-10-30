@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 
 use openssl::pkey::{PKey, Private};
 
+use crate::mutex_ext::LockOrRecover;
+
 const SESSION_TTL: Duration = Duration::from_secs(15 * 60);
 
 pub struct PendingSignature {
@@ -75,7 +77,7 @@ impl SigningState {
     }
 
     pub fn insert(&self, session_id: String, private_key: PKey<Private>, agent_token: String) {
-        let mut sessions = self.sessions.lock().expect("signing state mutex poisoned");
+        let mut sessions = self.sessions.lock_or_recover();
         sessions.retain(|_, v| v.expires_at > Instant::now());
         sessions.insert(
             session_id,
@@ -94,7 +96,7 @@ impl SigningState {
             Take,
         }
 
-        let mut sessions = self.sessions.lock().expect("signing state mutex poisoned");
+        let mut sessions = self.sessions.lock_or_recover();
         let decision = match sessions.get(session_id) {
             None => Decision::NotFound,
             // Expiry is checked before the token so an expired session can't

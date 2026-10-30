@@ -25,7 +25,9 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tiny_http::{Header, Method, Response, Server};
 use zeroize::Zeroizing;
 
+use crate::activity::SignerActivity;
 use crate::passphrase::prompt_passphrase;
+use crate::picker_memory::{last_certificate_dir, remember_certificate_path};
 use crate::protocol::{ErrorResponse, HealthResponse, PrepareRequest, PrepareResponse, SignDigestRequest, SignDigestResponse};
 use crate::state::{SigningState, TakeError};
 
@@ -196,27 +198,53 @@ pub fn spawn(app: AppHandle) {
         };
         println!("acta-ordia-signer: listening on http://127.0.0.1:{PORT}");
 
-        for mut request in server.incoming_requests() {
-            let origin = request
-                .headers()
-                .iter()
-                .find(|h| h.field.equiv("Origin"))
-                .map(|h| h.value.as_str().to_string());
-            let origin_allowed = is_origin_allowed(origin.as_deref());
-            let method = request.method().clone();
-            let url = request.url().to_string();
-            let signing_state = app.state::<SigningState>();
+        // One thread per connection, not one request at a time. A blocking
+        // `/prepare` (file picker / passphrase / confirm dialog, up to
+        // `DIALOG_TIMEOUT` = 5 minutes) used to starve every other request
+        // on this same accept loop, including `/health` — a user with a
+        // signing dialog open in one tab would see the agent reported as
+        // "not detected" from a second tab, purely because the single
+        // accept thread was blocked, not because anything was actually
+        // down. `SigningState`/`SignerActivity` are already `Mutex`/atomic-
+        // protected internally (they had to be — this loop already ran on
+        // a thread separate from Tauri's main thread even before this
+        // change), so concurrent handlers are safe. `tiny_http::Request`
+        // is documented as `Send` specifically for this pattern. Unbounded
+        // (no thread-pool cap): this binds to 127.0.0.1 only, for a single
+        // local browser session — not a public-facing server where
+        // connection-flood resource exhaustion would be a real concern.
+        for request in server.incoming_requests() {
+            let app = app.clone();
+            thread::spawn(move || {
+                let mut request = request;
+                let origin = request
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.equiv("Origin"))
+                    .map(|h| h.value.as_str().to_string());
+                let origin_allowed = is_origin_allowed(origin.as_deref());
+                let method = request.method().clone();
+                let url = request.url().to_string();
+                let signing_state = app.state::<SigningState>();
+                let activity = app.state::<SignerActivity>();
+                // Held for the whole request — this is what the quit-
+                // confirmation dialog checks, not SigningState's 15-minute
+                // session map (see activity.rs's module doc for why those
+                // are different things).
+                let _in_flight = (url != "/health").then(|| activity.enter_request());
 
-            let response = route(
-                &method,
-                &url,
-                origin_allowed,
-                || read_body_capped(&mut request),
-                signing_state.inner(),
-                |body| handle_prepare(&app, body),
-            );
+                let response = route(
+                    &method,
+                    &url,
+                    origin_allowed,
+                    || read_body_capped(&mut request),
+                    signing_state.inner(),
+                    activity.inner(),
+                    |body| handle_prepare(&app, body),
+                );
 
-            let _ = request.respond(response);
+                let _ = request.respond(response);
+            });
         }
     });
 }
@@ -238,6 +266,7 @@ fn route(
     origin_allowed: bool,
     read_body: impl FnOnce() -> String,
     signing_state: &SigningState,
+    activity: &SignerActivity,
     prepare: impl FnOnce(&str) -> tiny_http::ResponseBox,
 ) -> tiny_http::ResponseBox {
     match (method, url) {
@@ -251,7 +280,7 @@ fn route(
         }
         (Method::Post, "/sign") if origin_allowed => {
             let body = read_body();
-            handle_sign(signing_state, &body)
+            handle_sign(signing_state, activity, &body)
         }
         (Method::Post, "/prepare") | (Method::Post, "/sign") => json_response(
             &ErrorResponse::new("origin_not_allowed", "This agent only accepts requests from the Acta Ordia web app."),
@@ -280,39 +309,50 @@ fn handle_prepare(app: &AppHandle, body: &str) -> tiny_http::ResponseBox {
     };
 
     let (pick_tx, pick_rx) = mpsc::channel();
-    app.dialog()
-        .file()
-        .add_filter("PKCS#12 Certificate", &["p12", "pfx"])
-        .pick_file(move |picked| {
-            let _ = pick_tx.send(picked);
-        });
+    let mut file_dialog = app.dialog().file().add_filter("PKCS#12 Certificate", &["p12", "pfx"]);
+    // Best-effort convenience, not certificate detection — pre-seeds the
+    // picker at the directory of whichever .p12 was last selected on this
+    // machine, so the user doesn't re-browse to the same file every single
+    // signature. Silently skipped if nothing's remembered yet.
+    if let Some(dir) = last_certificate_dir(app) {
+        file_dialog = file_dialog.set_directory(dir);
+    }
+    file_dialog.pick_file(move |picked| {
+        let _ = pick_tx.send(picked);
+    });
     let picked = match pick_rx.recv_timeout(DIALOG_TIMEOUT) {
         Ok(p) => p,
         Err(_) => {
             crate::telemetry::report("file_picker_timeout");
+            app.state::<SignerActivity>().record("failed: timeout");
             return json_response(&ErrorResponse::new("timeout", "The certificate picker timed out."), 408);
         }
     };
     let Some(file_path) = picked else {
+        app.state::<SignerActivity>().record("failed: no_certificate");
         return json_response(&ErrorResponse::new("no_certificate", "No certificate file was selected."), 422);
     };
     let path = match file_path.into_path() {
         Ok(p) => p,
         Err(err) => {
             crate::telemetry::report("invalid_path");
+            app.state::<SignerActivity>().record("failed: invalid_path");
             return json_response(&ErrorResponse::new("invalid_path", err.to_string()), 500);
         }
     };
+    remember_certificate_path(app, &path);
     // Zeroizing: scrub the raw .p12 from heap memory on drop (finding 2).
     let p12_bytes = match std::fs::read(&path) {
         Ok(b) => Zeroizing::new(b),
         Err(err) => {
             crate::telemetry::report("read_failed");
+            app.state::<SignerActivity>().record("failed: read_failed");
             return json_response(&ErrorResponse::new("read_failed", err.to_string()), 500);
         }
     };
 
     let Some(passphrase) = prompt_passphrase(app) else {
+        app.state::<SignerActivity>().record("cancelled: passphrase");
         return json_response(&ErrorResponse::new("cancelled", "Passphrase entry was cancelled."), 409);
     };
 
@@ -320,15 +360,20 @@ fn handle_prepare(app: &AppHandle, body: &str) -> tiny_http::ResponseBox {
         Ok(p) => p,
         Err(err) => {
             crate::telemetry::report("invalid_certificate_der");
+            app.state::<SignerActivity>().record("failed: invalid_certificate");
             return json_response(&ErrorResponse::new("invalid_certificate", err.to_string()), 422);
         }
     };
     let parsed = match pkcs12.parse2(&passphrase) {
         Ok(p) => p,
-        Err(_) => return json_response(&ErrorResponse::new("wrong_password", "Incorrect certificate password."), 422),
+        Err(_) => {
+            app.state::<SignerActivity>().record("failed: wrong_password");
+            return json_response(&ErrorResponse::new("wrong_password", "Incorrect certificate password."), 422);
+        }
     };
     let (Some(cert), Some(private_key)) = (parsed.cert, parsed.pkey) else {
         crate::telemetry::report("certificate_missing_cert_or_key");
+        app.state::<SignerActivity>().record("failed: invalid_certificate");
         return json_response(&ErrorResponse::new("invalid_certificate", "The .p12 file has no certificate/key pair."), 422);
     };
 
@@ -362,10 +407,12 @@ fn handle_prepare(app: &AppHandle, body: &str) -> tiny_http::ResponseBox {
     match confirm_rx.recv_timeout(DIALOG_TIMEOUT) {
         Ok(true) => {}
         Ok(false) => {
+            app.state::<SignerActivity>().record("cancelled: confirm");
             return json_response(&ErrorResponse::new("cancelled", "Signing was cancelled by the user."), 409)
         }
         Err(_) => {
             crate::telemetry::report("confirm_dialog_timeout");
+            app.state::<SignerActivity>().record("failed: timeout");
             return json_response(&ErrorResponse::new("timeout", "The confirmation dialog timed out."), 408);
         }
     }
@@ -373,7 +420,10 @@ fn handle_prepare(app: &AppHandle, body: &str) -> tiny_http::ResponseBox {
     let mut chain_der_base64 = Vec::new();
     match cert.to_der() {
         Ok(der) => chain_der_base64.push(BASE64.encode(der)),
-        Err(err) => return json_response(&ErrorResponse::new("encode_failed", err.to_string()), 500),
+        Err(err) => {
+            app.state::<SignerActivity>().record("failed: encode_failed");
+            return json_response(&ErrorResponse::new("encode_failed", err.to_string()), 500);
+        }
     }
     if let Some(ca_stack) = parsed.ca {
         for ca_cert in ca_stack.iter() {
@@ -385,9 +435,13 @@ fn handle_prepare(app: &AppHandle, body: &str) -> tiny_http::ResponseBox {
 
     let agent_token = match generate_agent_token() {
         Ok(t) => t,
-        Err(err) => return json_response(&ErrorResponse::new("token_generation_failed", err), 500),
+        Err(err) => {
+            app.state::<SignerActivity>().record("failed: token_generation_failed");
+            return json_response(&ErrorResponse::new("token_generation_failed", err), 500);
+        }
     };
     app.state::<SigningState>().insert(req.session_id, private_key, agent_token.clone());
+    app.state::<SignerActivity>().record("prepared");
 
     json_response(
         &PrepareResponse { certificate_chain_base64: chain_der_base64, subject_cn, agent_token },
@@ -395,7 +449,7 @@ fn handle_prepare(app: &AppHandle, body: &str) -> tiny_http::ResponseBox {
     )
 }
 
-fn handle_sign(signing_state: &SigningState, body: &str) -> tiny_http::ResponseBox {
+fn handle_sign(signing_state: &SigningState, activity: &SignerActivity, body: &str) -> tiny_http::ResponseBox {
     let req: SignDigestRequest = match serde_json::from_str(body) {
         Ok(r) => r,
         Err(err) => return json_response(&ErrorResponse::new("invalid_request", err.to_string()), 400),
@@ -424,6 +478,7 @@ fn handle_sign(signing_state: &SigningState, body: &str) -> tiny_http::ResponseB
     // single real signing attempt forever (see pending-user-actions memory).
     if let Err(err) = verify_digest_signature(&active_digest_verifying_key(), &digest, &req.digest_signature_base64) {
         crate::telemetry::report("invalid_digest_signature");
+        activity.record("failed: invalid_digest_signature");
         return json_response(
             &ErrorResponse::new(
                 "invalid_digest_signature",
@@ -457,10 +512,12 @@ fn handle_sign(signing_state: &SigningState, body: &str) -> tiny_http::ResponseB
         Ok(sig) => sig,
         Err(err) => {
             crate::telemetry::report("sign_failed");
+            activity.record("failed: sign_failed");
             return json_response(&ErrorResponse::new("sign_failed", err), 500);
         }
     };
 
+    activity.record("signed");
     json_response(&SignDigestResponse { signature_base64: BASE64.encode(signature) }, 200)
 }
 
@@ -540,6 +597,9 @@ mod tests {
         let server = Server::http(("127.0.0.1", 0)).expect("bind ephemeral port");
         let port = server.server_addr().to_ip().expect("ip addr").port();
         thread::spawn(move || {
+            // No test here inspects activity tracking directly — it only
+            // needs to exist so `route()`'s real signature runs unchanged.
+            let activity = SignerActivity::default();
             for mut request in server.incoming_requests() {
                 let origin = request
                     .headers()
@@ -555,6 +615,7 @@ mod tests {
                     origin_allowed,
                     || read_body_capped(&mut request),
                     &state,
+                    &activity,
                     |_body| {
                         json_response(
                             &ErrorResponse::new("prepare_unreached", "the /prepare GUI path is never driven in tests"),
@@ -563,6 +624,56 @@ mod tests {
                     },
                 );
                 let _ = request.respond(response);
+            }
+        });
+        port
+    }
+
+    /// Mirrors `spawn()`'s real per-connection-thread concurrency (unlike
+    /// `spawn_test_server` above, which predates that fix and is still
+    /// single-threaded — fine for every other test here, since none of
+    /// them depend on two requests overlapping). Used only by the test
+    /// proving a slow `/prepare` no longer starves `/health`. `prepare_delay`
+    /// stands in for a real blocking GUI dialog.
+    fn spawn_concurrent_test_server(
+        state: Arc<SigningState>,
+        activity: Arc<SignerActivity>,
+        prepare_delay: Duration,
+    ) -> u16 {
+        let server = Server::http(("127.0.0.1", 0)).expect("bind ephemeral port");
+        let port = server.server_addr().to_ip().expect("ip addr").port();
+        thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let state = state.clone();
+                let activity = activity.clone();
+                thread::spawn(move || {
+                    let mut request = request;
+                    let origin = request
+                        .headers()
+                        .iter()
+                        .find(|h| h.field.equiv("Origin"))
+                        .map(|h| h.value.as_str().to_string());
+                    let origin_allowed = is_origin_allowed(origin.as_deref());
+                    let method = request.method().clone();
+                    let url = request.url().to_string();
+                    let _in_flight = (url != "/health").then(|| activity.enter_request());
+                    let response = route(
+                        &method,
+                        &url,
+                        origin_allowed,
+                        || read_body_capped(&mut request),
+                        &state,
+                        &activity,
+                        |_body| {
+                            thread::sleep(prepare_delay);
+                            json_response(
+                                &ErrorResponse::new("prepare_unreached", "slow stub for the concurrency test"),
+                                500,
+                            )
+                        },
+                    );
+                    let _ = request.respond(response);
+                });
             }
         });
         port
@@ -644,6 +755,44 @@ mod tests {
         assert_eq!(status, 200);
         assert!(body.contains("\"status\":\"ok\""), "body was: {body}");
         assert!(body.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn http_health_is_not_starved_by_a_slow_concurrent_prepare() {
+        // Regression test for the race the user's code review surfaced:
+        // before the per-connection-thread fix, a single accept-loop thread
+        // meant a blocking `/prepare` (real GUI dialogs can take up to
+        // DIALOG_TIMEOUT = 5 minutes) starved every other request,
+        // including `/health` — so a signing dialog open in one tab made
+        // the agent look "not detected" from a second tab, even though it
+        // was running fine.
+        const PREPARE_DELAY: Duration = Duration::from_millis(400);
+        let port = spawn_concurrent_test_server(
+            Arc::new(SigningState::default()),
+            Arc::new(SignerActivity::default()),
+            PREPARE_DELAY,
+        );
+
+        // Fire the slow /prepare in the background and deliberately don't
+        // wait for it — it's only here to occupy a request-handling slot
+        // for PREPARE_DELAY, standing in for a real blocked GUI dialog.
+        thread::spawn(move || {
+            let req = post("/prepare", Some(APP_ORIGIN), "{}");
+            let _ = http_send(port, &req);
+        });
+        thread::sleep(Duration::from_millis(50)); // let /prepare actually start
+
+        let start = std::time::Instant::now();
+        let health_req = b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+        let (status, body) = http_send(port, health_req);
+        let elapsed = start.elapsed();
+
+        assert_eq!(status, 200);
+        assert!(body.contains("\"status\":\"ok\""), "body was: {body}");
+        assert!(
+            elapsed < PREPARE_DELAY / 2,
+            "/health took {elapsed:?} while a slow /prepare was in flight — it should answer immediately, not wait on an unrelated request"
+        );
     }
 
     #[test]

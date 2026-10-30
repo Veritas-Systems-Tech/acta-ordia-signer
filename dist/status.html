@@ -1,0 +1,107 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Acta Ordia Signer — Status</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        margin: 0;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #1a1a2e;
+        color: #f0f0f0;
+        font-size: 13px;
+      }
+      .section { padding: 16px 20px; border-bottom: 1px solid #2a2a45; }
+      .section:last-child { border-bottom: none; }
+      h1 { font-size: 14px; font-weight: 600; margin: 0 0 2px; display: flex; align-items: center; gap: 6px; }
+      .dot { width: 8px; height: 8px; border-radius: 50%; background: #4ade80; display: inline-block; }
+      .muted { color: #a0a0b0; font-size: 12px; }
+      .row { display: flex; justify-content: space-between; margin-top: 8px; }
+      h2 { font-size: 12px; font-weight: 600; color: #a0a0b0; text-transform: uppercase; letter-spacing: 0.04em; margin: 0 0 8px; }
+      ul { list-style: none; margin: 0; padding: 0; max-height: 220px; overflow-y: auto; }
+      li { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #23233a; gap: 8px; }
+      li:last-child { border-bottom: none; }
+      li .label { flex: 1; }
+      li .time { color: #70708a; white-space: nowrap; }
+      #empty { color: #70708a; font-style: italic; }
+    </style>
+  </head>
+  <body>
+    <div class="section">
+      <h1><span class="dot"></span>Acta Ordia Signer is running</h1>
+      <div class="muted">Private key never leaves this machine.</div>
+      <div class="row">
+        <span class="muted">Version</span>
+        <span id="version">—</span>
+      </div>
+      <div class="row">
+        <span class="muted">Start at login</span>
+        <span id="autostart">—</span>
+      </div>
+    </div>
+    <div class="section">
+      <h2>Recent activity on this machine</h2>
+      <ul id="activity-list"></ul>
+      <div id="empty" style="display:none">No signing activity yet this session.</div>
+    </div>
+    <script>
+      const { invoke } = window.__TAURI__.core;
+
+      const LABELS = {
+        prepared: "Certificate selected, awaiting signature",
+        signed: "Document signed",
+        "cancelled: passphrase": "Cancelled (passphrase entry)",
+        "cancelled: confirm": "Cancelled (signing confirmation)",
+        "failed: no_certificate": "Failed — no certificate selected",
+        "failed: wrong_password": "Failed — incorrect certificate password",
+        "failed: invalid_certificate": "Failed — invalid certificate file",
+        "failed: read_failed": "Failed — could not read the certificate file",
+        "failed: invalid_path": "Failed — invalid file path",
+        "failed: encode_failed": "Failed — could not encode the certificate",
+        "failed: token_generation_failed": "Failed — could not generate a session token",
+        "failed: timeout": "Failed — timed out waiting for a response",
+        "failed: invalid_digest_signature": "Failed — could not verify this came from Acta Ordia",
+        "failed: sign_failed": "Failed — signing operation failed",
+      };
+
+      function describeLabel(label) {
+        return LABELS[label] || label;
+      }
+
+      function formatTime(atMs) {
+        if (!atMs) return "";
+        return new Date(atMs).toLocaleTimeString();
+      }
+
+      async function render() {
+        const status = await invoke("get_signer_status");
+        document.getElementById("version").textContent = status.version;
+        document.getElementById("autostart").textContent = status.autostart_enabled ? "On" : "Off";
+
+        const list = document.getElementById("activity-list");
+        const empty = document.getElementById("empty");
+        list.innerHTML = "";
+        if (status.activity.length === 0) {
+          empty.style.display = "block";
+          return;
+        }
+        empty.style.display = "none";
+        for (const entry of [...status.activity].reverse()) {
+          const li = document.createElement("li");
+          const label = document.createElement("span");
+          label.className = "label";
+          label.textContent = describeLabel(entry.label);
+          const time = document.createElement("span");
+          time.className = "time";
+          time.textContent = formatTime(entry.at_ms);
+          li.appendChild(label);
+          li.appendChild(time);
+          list.appendChild(li);
+        }
+      }
+
+      render();
+    </script>
+  </body>
+</html>
