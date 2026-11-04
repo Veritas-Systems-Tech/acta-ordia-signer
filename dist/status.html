@@ -39,6 +39,10 @@
         <span class="muted">Start at login</span>
         <span id="autostart">—</span>
       </div>
+      <div class="row">
+        <span class="muted">Share crash reports</span>
+        <span id="crash-reports">—</span>
+      </div>
     </div>
     <div class="section">
       <h2>Recent activity on this machine</h2>
@@ -62,6 +66,10 @@
         "failed: token_generation_failed": "Failed — could not generate a session token",
         "failed: timeout": "Failed — timed out waiting for a response",
         "failed: invalid_digest_signature": "Failed — could not verify this came from Acta Ordia",
+        "failed: unsupported_protocol": "Failed — signer and Acta Ordia versions differ; update the signer",
+        "failed: signature_expired": "Failed — the signing request expired",
+        "failed: fingerprint_mismatch": "Failed — the request was for a different certificate",
+        "failed: invalid_fingerprint": "Failed — malformed signing request",
         "failed: sign_failed": "Failed — signing operation failed",
       };
 
@@ -78,6 +86,7 @@
         const status = await invoke("get_signer_status");
         document.getElementById("version").textContent = status.version;
         document.getElementById("autostart").textContent = status.autostart_enabled ? "On" : "Off";
+        document.getElementById("crash-reports").textContent = status.crash_reports_enabled ? "On" : "Off";
 
         const list = document.getElementById("activity-list");
         const empty = document.getElementById("empty");

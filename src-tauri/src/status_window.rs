@@ -18,6 +18,7 @@ use crate::activity::{ActivityEntry, SignerActivity};
 pub struct StatusSnapshot {
     version: &'static str,
     autostart_enabled: bool,
+    crash_reports_enabled: bool,
     activity: Vec<ActivityEntry>,
 }
 
@@ -29,6 +30,9 @@ pub fn get_signer_status(app: AppHandle, activity: tauri::State<SignerActivity>)
         // reporting "false" rather than erroring the whole popover for what
         // is, worst case, a cosmetically wrong checkbox state elsewhere.
         autostart_enabled: app.autolaunch().is_enabled().unwrap_or(false),
+        // Read-only here, same as autostart — the toggle itself lives only
+        // on the tray menu (this window's own doc comment above).
+        crash_reports_enabled: crate::telemetry::is_enabled(),
         activity: activity.recent(),
     }
 }

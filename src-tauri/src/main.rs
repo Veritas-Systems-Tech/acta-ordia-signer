@@ -82,6 +82,15 @@ fn toggle_autostart(app: &tauri::AppHandle, item: &CheckMenuItem<tauri::Wry>) {
     }
 }
 
+/// Mirrors `toggle_autostart` above. Takes effect immediately (no restart
+/// needed) — `telemetry::set_enabled` updates the in-process cache that
+/// `report()`/`before_send` check on every call.
+fn toggle_crash_reports(app: &tauri::AppHandle, item: &CheckMenuItem<tauri::Wry>) {
+    let enabled = telemetry::is_enabled();
+    telemetry::set_enabled(app, !enabled);
+    let _ = item.set_checked(!enabled);
+}
+
 /// User-triggered check (the "Check for Updates" menu item) — unlike the
 /// silent startup check, this one always reports back, including "already
 /// up to date" and "couldn't check," and installs + restarts immediately
@@ -151,6 +160,11 @@ fn main() {
         .setup(|app| {
             server::spawn(app.handle().clone());
 
+            // Always loaded, even on an existing install with no preference
+            // yet saved — defaults the in-process cache to "enabled" (see
+            // telemetry.rs's module doc for why this can't happen earlier).
+            telemetry::load_and_cache_preference(app.handle());
+
             // Default-on, user-confirmed: a signing tool should just be
             // ready. Only asserted on the actual first run — never
             // re-asserted later, so an explicit opt-out via the tray
@@ -161,7 +175,7 @@ fn main() {
                     .notification()
                     .builder()
                     .title("Acta Ordia Signer")
-                    .body("Running in your system tray — look for the icon when you need to sign a document.")
+                    .body("Running in your system tray — look for the icon when you need to sign a document. Anonymous crash reports (error type only — never your passphrase or certificate) help us catch bugs; turn off anytime from the tray menu.")
                     .show();
             }
 
@@ -190,11 +204,23 @@ fn main() {
             let status_item = MenuItem::with_id(app, "status", "Status…", true, None::<&str>)?;
             let autostart_item =
                 CheckMenuItem::with_id(app, "autostart", "Start at login", true, autostart_enabled, None::<&str>)?;
+            let crash_reports_item = CheckMenuItem::with_id(
+                app,
+                "crash_reports",
+                "Share crash reports",
+                true,
+                telemetry::is_enabled(),
+                None::<&str>,
+            )?;
             let update_item = MenuItem::with_id(app, "check_updates", "Check for Updates", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit Acta Ordia Signer", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&status_item, &autostart_item, &update_item, &quit_item])?;
+            let menu = Menu::with_items(
+                app,
+                &[&status_item, &autostart_item, &crash_reports_item, &update_item, &quit_item],
+            )?;
 
             let autostart_item_for_toggle = autostart_item.clone();
+            let crash_reports_item_for_toggle = crash_reports_item.clone();
 
             TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
@@ -221,6 +247,7 @@ fn main() {
                     "status" => status_window::open_status_window(app),
                     "check_updates" => check_for_updates_now(app),
                     "autostart" => toggle_autostart(app, &autostart_item_for_toggle),
+                    "crash_reports" => toggle_crash_reports(app, &crash_reports_item_for_toggle),
                     _ => {}
                 })
                 .build(app)?;
