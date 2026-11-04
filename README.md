@@ -237,6 +237,26 @@ same as correct at runtime against real inputs:**
   "unknown publisher" warning on first install); the update *channel*
   itself is still cryptographically verified regardless — see "Trust
   model" below.
+- **`/prepare` route has no test coverage of its own** — unlike `/sign`, which
+  `server.rs`'s test module exercises directly via a `post("/sign", ...)` test
+  harness covering most of its failure paths (malformed body, fingerprint
+  mismatch, altered/expired signed message, wrong key, etc.), `handle_prepare`
+  is only touched incidentally by the origin-allowlist loop test and a
+  concurrency smoke test (`http_health_is_not_starved_by_a_slow_concurrent_prepare`),
+  neither of which exercises its actual logic. The underlying pieces it calls
+  (`Pkcs12::from_der`/`parse2`, `subject_common_name`, `sanitize_title`) do
+  have their own unit tests, but the route's own error paths —
+  `prepare_invalid_request` (malformed JSON), `file_picker_timeout`,
+  "no certificate selected", `invalid_path`, `read_failed`,
+  `invalid_certificate_der`, `certificate_missing_cert_or_key`, wrong
+  password, cancelled passphrase, cancelled confirm — are untested as a
+  route. Harder than `/sign` to close directly: every one of those paths sits
+  behind a real native file-picker dialog and/or passphrase/confirm windows
+  (`app.dialog()`, the passphrase channel), which need a live `AppHandle` and
+  can't run headlessly the way `/sign`'s test harness does. Needs either a
+  seam to inject a fake picker/dialog result for tests, or accepting this as
+  manually-verified-only and saying so explicitly rather than looking covered
+  by the counts above.
 - **Automated OS-level install → update test in CI** — `tests/updater_integration.rs`
   now runs tauri-plugin-updater's real manifest-parsing and Ed25519
   signature-verification path on every `cargo test` run (headless, no GUI,
