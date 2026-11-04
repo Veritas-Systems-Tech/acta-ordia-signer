@@ -174,6 +174,8 @@ pub mod signed_message {
         InvalidDigestSignature,
         SignatureExpired,
         FingerprintMismatch,
+        /// The signer's clock is unreadable, so expiry cannot be enforced.
+        ClockUnavailable,
     }
 
     impl Reject {
@@ -184,6 +186,7 @@ pub mod signed_message {
                 Reject::InvalidDigestSignature => "invalid_digest_signature",
                 Reject::SignatureExpired => "signature_expired",
                 Reject::FingerprintMismatch => "fingerprint_mismatch",
+                Reject::ClockUnavailable => "clock_unavailable",
             }
         }
         /// Static human text, safe to show; contains no request data.
@@ -196,11 +199,13 @@ pub mod signed_message {
                 Reject::InvalidDigestSignature => "The signing request is not authenticated by the Acta Ordia backend.",
                 Reject::SignatureExpired => "The signing request has expired. Start the signing again.",
                 Reject::FingerprintMismatch => "The signing request is for a different certificate.",
+                Reject::ClockUnavailable => "This computer's clock could not be read, so the request cannot be checked for expiry.",
             }
         }
         pub fn status(self) -> u16 {
             match self {
                 Reject::UnsupportedProtocol | Reject::InvalidFingerprint => 400,
+                Reject::ClockUnavailable => 500,
                 _ => 403,
             }
         }

@@ -74,8 +74,20 @@ revealed to the backend *before* a digest can even exist. Full flow:
    fingerprint equals the certificate it unlocked at `/prepare`. Any failure
    returns a static error code (`unsupported_protocol`,
    `invalid_fingerprint`, `invalid_digest_signature`, `signature_expired`,
-   `fingerprint_mismatch`) with no request data in the text, session left
-   intact. It also checks the `agent_token` (constant-time compare; missing/wrong →
+   `fingerprint_mismatch`, or `clock_unavailable` — HTTP 500 — if the signer's
+   own clock cannot be read as after the Unix epoch, so expiry cannot be
+   enforced and the request fails closed) with no request data in the text,
+   session left intact. A malformed JSON body gets a static `invalid_request`
+   (400) with no serde error text. A `sign_failed` (500, the RSA operation
+   itself failing) is the one failure that consumes the session; every other
+   reject leaves it intact. A signer clock that is merely fast is tolerated by
+   the 60 s skew allowance and not otherwise detected. Bad Ed25519 signatures
+   are reported to Sentry at most once per 10 minutes per process. `/prepare`
+   follows the same rule: every error response (malformed body, invalid path,
+   unreadable file, invalid certificate, encode and token failures) carries a
+   static code and message with the same HTTP status as before, and never a
+   path, OS error, serde, OpenSSL or certificate text. `/sign` likewise returns
+   a static message for `sign_failed`. It also checks the `agent_token` (constant-time compare; missing/wrong →
    `403 invalid_agent_token`, session left intact) as a secondary
    session-binding step. Only then does it build a DigestInfo (SHA-256 OID +
    digest), sign it with a **raw RSA PKCS1v1.5 encrypt** (not a hashing sign

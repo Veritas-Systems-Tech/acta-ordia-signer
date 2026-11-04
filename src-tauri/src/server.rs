@@ -287,12 +287,48 @@ fn read_body_capped(request: &mut tiny_http::Request) -> String {
     body
 }
 
+/// A `/prepare` failure: static code, static message, fixed status. Never
+/// built from OS, serde, OpenSSL, path or certificate text.
+struct PrepareFailure {
+    code: &'static str,
+    message: &'static str,
+    status: u16,
+}
+
+impl PrepareFailure {
+    const INVALID_REQUEST: Self =
+        Self { code: "invalid_request", message: "The signing request body is malformed.", status: 400 };
+    const INVALID_PATH: Self =
+        Self { code: "invalid_path", message: "The selected file path could not be used.", status: 500 };
+    const READ_FAILED: Self =
+        Self { code: "read_failed", message: "The certificate file could not be read.", status: 500 };
+    const INVALID_CERTIFICATE: Self =
+        Self { code: "invalid_certificate", message: "The selected file is not a valid .p12 certificate.", status: 422 };
+    const ENCODE_FAILED: Self =
+        Self { code: "encode_failed", message: "The certificate could not be encoded.", status: 500 };
+    const TOKEN_GENERATION_FAILED: Self =
+        Self { code: "token_generation_failed", message: "A session token could not be generated.", status: 500 };
+
+    fn respond(&self) -> tiny_http::ResponseBox {
+        json_response(&ErrorResponse::new(self.code, self.message), self.status)
+    }
+}
+
+fn read_certificate_file(path: &std::path::Path) -> Result<Zeroizing<Vec<u8>>, PrepareFailure> {
+    std::fs::read(path).map(Zeroizing::new).map_err(|_| PrepareFailure::READ_FAILED)
+}
+
+fn parse_pkcs12_der(der: &[u8]) -> Result<Pkcs12, PrepareFailure> {
+    Pkcs12::from_der(der).map_err(|_| PrepareFailure::INVALID_CERTIFICATE)
+}
+
 fn handle_prepare(app: &AppHandle, body: &str) -> tiny_http::ResponseBox {
     let req: PrepareRequest = match serde_json::from_str(body) {
         Ok(r) => r,
-        Err(err) => {
+        // Static text only: serde's error text can quote the offending value.
+        Err(_) => {
             crate::telemetry::report("prepare_invalid_request");
-            return json_response(&ErrorResponse::new("invalid_request", err.to_string()), 400);
+            return PrepareFailure::INVALID_REQUEST.respond();
         }
     };
 
@@ -322,20 +358,20 @@ fn handle_prepare(app: &AppHandle, body: &str) -> tiny_http::ResponseBox {
     };
     let path = match file_path.into_path() {
         Ok(p) => p,
-        Err(err) => {
+        Err(_) => {
             crate::telemetry::report("invalid_path");
             app.state::<SignerActivity>().record("failed: invalid_path");
-            return json_response(&ErrorResponse::new("invalid_path", err.to_string()), 500);
+            return PrepareFailure::INVALID_PATH.respond();
         }
     };
     remember_certificate_path(app, &path);
     // Zeroizing: scrub the raw .p12 from heap memory on drop (finding 2).
-    let p12_bytes = match std::fs::read(&path) {
-        Ok(b) => Zeroizing::new(b),
-        Err(err) => {
+    let p12_bytes = match read_certificate_file(&path) {
+        Ok(b) => b,
+        Err(f) => {
             crate::telemetry::report("read_failed");
             app.state::<SignerActivity>().record("failed: read_failed");
-            return json_response(&ErrorResponse::new("read_failed", err.to_string()), 500);
+            return f.respond();
         }
     };
 
@@ -344,12 +380,12 @@ fn handle_prepare(app: &AppHandle, body: &str) -> tiny_http::ResponseBox {
         return json_response(&ErrorResponse::new("cancelled", "Passphrase entry was cancelled."), 409);
     };
 
-    let pkcs12 = match Pkcs12::from_der(&p12_bytes) {
+    let pkcs12 = match parse_pkcs12_der(&p12_bytes) {
         Ok(p) => p,
-        Err(err) => {
+        Err(f) => {
             crate::telemetry::report("invalid_certificate_der");
             app.state::<SignerActivity>().record("failed: invalid_certificate");
-            return json_response(&ErrorResponse::new("invalid_certificate", err.to_string()), 422);
+            return f.respond();
         }
     };
     let parsed = match pkcs12.parse2(&passphrase) {
@@ -406,15 +442,15 @@ fn handle_prepare(app: &AppHandle, body: &str) -> tiny_http::ResponseBox {
     }
 
     let mut chain_der_base64 = Vec::new();
-    let cert_fingerprint = match cert.to_der().map_err(|e| e.to_string()).and_then(|der| {
-        let fp = leaf_fingerprint(&der)?;
+    let cert_fingerprint = match cert.to_der().map_err(|_| ()).and_then(|der| {
+        let fp = leaf_fingerprint(&der).map_err(|_| ())?;
         chain_der_base64.push(BASE64.encode(der));
         Ok(fp)
     }) {
         Ok(fp) => fp,
-        Err(err) => {
+        Err(()) => {
             app.state::<SignerActivity>().record("failed: encode_failed");
-            return json_response(&ErrorResponse::new("encode_failed", err), 500);
+            return PrepareFailure::ENCODE_FAILED.respond();
         }
     };
     if let Some(ca_stack) = parsed.ca {
@@ -427,9 +463,9 @@ fn handle_prepare(app: &AppHandle, body: &str) -> tiny_http::ResponseBox {
 
     let agent_token = match generate_agent_token() {
         Ok(t) => t,
-        Err(err) => {
+        Err(_) => {
             app.state::<SignerActivity>().record("failed: token_generation_failed");
-            return json_response(&ErrorResponse::new("token_generation_failed", err), 500);
+            return PrepareFailure::TOKEN_GENERATION_FAILED.respond();
         }
     };
     app.state::<SigningState>().insert(req.session_id, private_key, agent_token.clone(), cert_fingerprint);
@@ -442,9 +478,25 @@ fn handle_prepare(app: &AppHandle, body: &str) -> tiny_http::ResponseBox {
 }
 
 fn handle_sign(signing_state: &SigningState, activity: &SignerActivity, body: &str) -> tiny_http::ResponseBox {
+    handle_sign_with_clock(signing_state, activity, body, now_unix)
+}
+
+/// `handle_sign` with an injectable clock (unix seconds, `None` = unreadable).
+fn handle_sign_with_clock(
+    signing_state: &SigningState,
+    activity: &SignerActivity,
+    body: &str,
+    clock: impl Fn() -> Option<u64>,
+) -> tiny_http::ResponseBox {
     let req: SignDigestRequest = match serde_json::from_str(body) {
         Ok(r) => r,
-        Err(err) => return json_response(&ErrorResponse::new("invalid_request", err.to_string()), 400),
+        // Static text only: serde's error text can quote the offending value.
+        Err(_) => {
+            return json_response(
+                &ErrorResponse::new("invalid_request", "The signing request body is malformed."),
+                400,
+            )
+        }
     };
 
     // Static codes and messages only: nothing from the request is echoed back.
@@ -483,10 +535,21 @@ fn handle_sign(signing_state: &SigningState, activity: &SignerActivity, body: &s
     // single real signing attempt forever (see pending-user-actions memory).
     let message = signed_message::build_message(&req.session_id, &claimed_fingerprint, req.expires_at_unix, &digest);
     if let Err(r) = signed_message::verify_signature(&active_digest_verifying_key(), &message, &req.digest_signature_base64) {
-        crate::telemetry::report("invalid_digest_signature");
+        // A bad signature is attacker-triggerable, so Sentry gets at most one
+        // event per BAD_SIGNATURE_REPORT_INTERVAL_SECS; the rest stay local.
+        if bad_signature_limiter().allow(monotonic_secs()) {
+            crate::telemetry::report("invalid_digest_signature");
+        } else {
+            eprintln!("invalid_digest_signature (not reported: rate-limited)");
+        }
         return reject(activity, r);
     }
-    if let Err(r) = signed_message::check_expiry(req.expires_at_unix, now_unix()) {
+    // Fail closed: without a readable clock, expiry cannot be enforced.
+    let now = match clock() {
+        Some(n) => n,
+        None => return reject(activity, Reject::ClockUnavailable),
+    };
+    if let Err(r) = signed_message::check_expiry(req.expires_at_unix, now) {
         return reject(activity, r);
     }
 
@@ -515,10 +578,13 @@ fn handle_sign(signing_state: &SigningState, activity: &SignerActivity, body: &s
 
     let signature = match sign_digest_info(&private_key, &digest_info) {
         Ok(sig) => sig,
-        Err(err) => {
+        Err(_) => {
             crate::telemetry::report("sign_failed");
             activity.record("failed: sign_failed");
-            return json_response(&ErrorResponse::new("sign_failed", err), 500);
+            return json_response(
+                &ErrorResponse::new("sign_failed", "The signing operation failed. Start the signing again."),
+                500,
+            );
         }
     };
 
@@ -532,11 +598,51 @@ fn leaf_fingerprint(der: &[u8]) -> Result<[u8; 32], String> {
     h.as_ref().try_into().map_err(|_| "unexpected SHA-256 length".to_string())
 }
 
-fn now_unix() -> u64 {
+/// Unix seconds, or `None` if the clock is before the epoch (or exactly at
+/// it) — callers must fail closed rather than treat that as time zero.
+fn now_unix() -> Option<u64> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
+        .ok()
         .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .filter(|&s| s > 0)
+}
+
+/// Minimum spacing between Sentry reports of an invalid digest signature.
+const BAD_SIGNATURE_REPORT_INTERVAL_SECS: u64 = 10 * 60;
+
+/// At most one `allow() == true` per interval, per process.
+struct ReportLimiter {
+    interval_secs: u64,
+    last: std::sync::Mutex<Option<u64>>,
+}
+
+impl ReportLimiter {
+    const fn new(interval_secs: u64) -> Self {
+        Self { interval_secs, last: std::sync::Mutex::new(None) }
+    }
+    /// `now` is any monotonic seconds counter.
+    fn allow(&self, now: u64) -> bool {
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        match *last {
+            Some(t) if now.saturating_sub(t) < self.interval_secs => false,
+            _ => {
+                *last = Some(now);
+                true
+            }
+        }
+    }
+}
+
+fn bad_signature_limiter() -> &'static ReportLimiter {
+    static L: ReportLimiter = ReportLimiter::new(BAD_SIGNATURE_REPORT_INTERVAL_SECS);
+    &L
+}
+
+/// Seconds since first call; immune to wall-clock changes.
+fn monotonic_secs() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new()  ;
+    START.get_or_init(std::time::Instant::now).elapsed().as_secs()
 }
 
 /// Raw RSA PKCS1v1.5 sign over an already-built DigestInfo — NOT a hashing
@@ -740,6 +846,10 @@ mod tests {
     /// Fingerprint the test sessions are "unlocked" with.
     const TEST_FP: [u8; 32] = [0x22u8; 32];
 
+    fn now_secs() -> u64 {
+        now_unix().expect("test clock")
+    }
+
     fn fp_hex(fp: &[u8; 32]) -> String {
         fp.iter().map(|b| format!("{b:02x}")).collect()
     }
@@ -775,7 +885,7 @@ mod tests {
     /// `TEST_FP`/`TEST_DIGEST`, expiring in 120 s — so tests exercising the
     /// token/session logic reach it instead of stopping at an earlier gate.
     fn sign_body(session_id: &str, agent_token: Option<&str>) -> String {
-        let expires = now_unix() + 120;
+        let expires = now_secs() + 120;
         sign_body_with(
             session_id,
             agent_token,
@@ -1032,7 +1142,7 @@ mod tests {
         use ed25519_dalek::Signer;
         let port = port_with_session("sess-badsig");
         let attacker = ephemeral_signing_key();
-        let expires = now_unix() + 120;
+        let expires = now_secs() + 120;
         let msg = signed_message::build_message("sess-badsig", &TEST_FP, expires, &TEST_DIGEST);
         let bad = BASE64.encode(attacker.sign(&msg).to_bytes());
         let body = sign_body_with("sess-badsig", Some("real"), 1, &fp_hex(&TEST_FP), expires, &TEST_DIGEST, &bad);
@@ -1056,7 +1166,7 @@ mod tests {
     fn http_sign_wrong_session_id_in_message_fails() {
         // Signature was minted for another session id, replayed under this one.
         let port = port_with_session("sess-a");
-        let expires = now_unix() + 120;
+        let expires = now_secs() + 120;
         let sig = signed_message_b64("sess-OTHER", &TEST_FP, expires, &TEST_DIGEST);
         let body = sign_body_with("sess-a", Some("real"), 1, &fp_hex(&TEST_FP), expires, &TEST_DIGEST, &sig);
         let (status, resp) = sign_status(port, &body);
@@ -1071,7 +1181,7 @@ mod tests {
         // (valid signature), but the agent unlocked TEST_FP.
         let port = port_with_session("sess-fp");
         let other = [0x33u8; 32];
-        let expires = now_unix() + 120;
+        let expires = now_secs() + 120;
         let sig = signed_message_b64("sess-fp", &other, expires, &TEST_DIGEST);
         let body = sign_body_with("sess-fp", Some("real"), 1, &fp_hex(&other), expires, &TEST_DIGEST, &sig);
         let (status, resp) = sign_status(port, &body);
@@ -1088,7 +1198,7 @@ mod tests {
         // signed a message for another cert: rebuilt message differs.
         let port = port_with_session("sess-fp2");
         let other = [0x33u8; 32];
-        let expires = now_unix() + 120;
+        let expires = now_secs() + 120;
         let sig = signed_message_b64("sess-fp2", &other, expires, &TEST_DIGEST);
         let body = sign_body_with("sess-fp2", Some("real"), 1, &fp_hex(&TEST_FP), expires, &TEST_DIGEST, &sig);
         let (status, resp) = sign_status(port, &body);
@@ -1099,14 +1209,14 @@ mod tests {
     #[test]
     fn http_sign_expired_message_fails() {
         let port = port_with_session("sess-exp");
-        let expires = now_unix() - (signed_message::EXPIRY_SKEW_SECS + 30);
+        let expires = now_secs() - (signed_message::EXPIRY_SKEW_SECS + 30);
         let sig = signed_message_b64("sess-exp", &TEST_FP, expires, &TEST_DIGEST);
         let body = sign_body_with("sess-exp", Some("real"), 1, &fp_hex(&TEST_FP), expires, &TEST_DIGEST, &sig);
         let (status, resp) = sign_status(port, &body);
         assert_eq!(status, 403);
         assert!(resp.contains("signature_expired"), "body was: {resp}");
         // Within skew is still accepted.
-        let expires = now_unix() - (signed_message::EXPIRY_SKEW_SECS - 30);
+        let expires = now_secs() - (signed_message::EXPIRY_SKEW_SECS - 30);
         let sig = signed_message_b64("sess-exp", &TEST_FP, expires, &TEST_DIGEST);
         let body = sign_body_with("sess-exp", Some("real"), 1, &fp_hex(&TEST_FP), expires, &TEST_DIGEST, &sig);
         assert_eq!(sign_status(port, &body).0, 200);
@@ -1115,7 +1225,7 @@ mod tests {
     #[test]
     fn http_sign_altered_digest_fails() {
         let port = port_with_session("sess-dig");
-        let expires = now_unix() + 120;
+        let expires = now_secs() + 120;
         let sig = signed_message_b64("sess-dig", &TEST_FP, expires, &TEST_DIGEST);
         let altered = [0x99u8; 32];
         let body = sign_body_with("sess-dig", Some("real"), 1, &fp_hex(&TEST_FP), expires, &altered, &sig);
@@ -1128,9 +1238,9 @@ mod tests {
     fn http_sign_altered_expiry_fails() {
         // Extending the expiry after the fact invalidates the signature.
         let port = port_with_session("sess-ext");
-        let signed_exp = now_unix() - 1000;
+        let signed_exp = now_secs() - 1000;
         let sig = signed_message_b64("sess-ext", &TEST_FP, signed_exp, &TEST_DIGEST);
-        let body = sign_body_with("sess-ext", Some("real"), 1, &fp_hex(&TEST_FP), now_unix() + 120, &TEST_DIGEST, &sig);
+        let body = sign_body_with("sess-ext", Some("real"), 1, &fp_hex(&TEST_FP), now_secs() + 120, &TEST_DIGEST, &sig);
         let (status, resp) = sign_status(port, &body);
         assert_eq!(status, 403);
         assert!(resp.contains("invalid_digest_signature"), "body was: {resp}");
@@ -1142,7 +1252,7 @@ mod tests {
         // domain prefix, and one with a different prefix must all fail.
         use ed25519_dalek::Signer;
         let port = port_with_session("sess-pre");
-        let expires = now_unix() + 120;
+        let expires = now_secs() + 120;
         let key = test_digest_signing_key();
         let layout = |prefix: &[u8]| {
             let mut m = Vec::new();
@@ -1193,7 +1303,7 @@ mod tests {
         assert_eq!(status, 400);
         assert!(resp.contains("unsupported_protocol"), "body was: {resp}");
 
-        let expires = now_unix() + 120;
+        let expires = now_secs() + 120;
         let sig = signed_message_b64("sess-ver", &TEST_FP, expires, &TEST_DIGEST);
         let body = sign_body_with("sess-ver", Some("real"), 2, &fp_hex(&TEST_FP), expires, &TEST_DIGEST, &sig);
         let (status, resp) = sign_status(port, &body);
@@ -1204,7 +1314,7 @@ mod tests {
     #[test]
     fn http_sign_malformed_fingerprint_is_rejected_statically() {
         let port = port_with_session("sess-bad-fp");
-        let expires = now_unix() + 120;
+        let expires = now_secs() + 120;
         let sig = signed_message_b64("sess-bad-fp", &TEST_FP, expires, &TEST_DIGEST);
         let body = sign_body_with("sess-bad-fp", Some("real"), 1, "zz-not-hex", expires, &TEST_DIGEST, &sig);
         let (status, resp) = sign_status(port, &body);
@@ -1389,5 +1499,146 @@ mod tests {
         let cert = builder.build();
 
         assert_eq!(subject_common_name(&cert), None);
+    }
+
+    #[test]
+    fn http_sign_malformed_body_does_not_echo_request_values() {
+        let port = port_with_session("sess-malformed");
+        let body = r#"{"session_id":"s","bytes_to_sign_base64":"x","digest_signature_base64":"x","signed_message_version":1,"cert_fingerprint_sha256_hex":"x","expires_at_unix":"SECRET"}"#;
+        let (status, resp) = sign_status(port, body);
+        assert_eq!(status, 400);
+        assert!(resp.contains("invalid_request") && !resp.contains("SECRET"), "body was: {resp}");
+        let body = r#"{"session_id":"s","bytes_to_sign_base64":"x","digest_signature_base64":"x","signed_message_version":"SECRET","cert_fingerprint_sha256_hex":"x","expires_at_unix":1}"#;
+        let (status, resp) = sign_status(port, body);
+        assert_eq!(status, 400);
+        assert!(resp.contains("invalid_request") && !resp.contains("SECRET"), "body was: {resp}");
+    }
+
+    #[test]
+    fn unreadable_clock_fails_closed_without_consuming_the_session() {
+        let state = SigningState::default();
+        state.insert("sess-clock".into(), test_key(), "real".into(), TEST_FP);
+        let activity = SignerActivity::default();
+        let body = sign_body("sess-clock", Some("real"));
+        let resp = handle_sign_with_clock(&state, &activity, &body, || None);
+        assert_eq!(resp.status_code().0, 500);
+        let mut text = String::new();
+        resp.into_reader().read_to_string(&mut text).unwrap();
+        assert!(text.contains("clock_unavailable"), "body was: {text}");
+        // Session still usable with a working clock.
+        let resp = handle_sign_with_clock(&state, &activity, &body, now_unix);
+        assert_eq!(resp.status_code().0, 200);
+    }
+
+    #[test]
+    fn expiry_skew_is_pinned_to_sixty_seconds() {
+        assert_eq!(signed_message::EXPIRY_SKEW_SECS, 60);
+    }
+
+    #[test]
+    fn bad_signature_report_limiter_allows_one_per_interval() {
+        let l = ReportLimiter::new(600);
+        assert!(l.allow(1000), "first is reported");
+        assert!(!l.allow(1000));
+        assert!(!l.allow(1599));
+        assert!(l.allow(1600), "reported again once the interval has passed");
+        assert!(!l.allow(1700));
+    }
+
+    // Shared cross-language vector: the same constants and expected hex are
+    // checked in acta-ordia functions/src/__tests__/signed-message.test.ts.
+    // Throwaway seed, never a real key. Expected values generated with node
+    // crypto (independent of this code).
+    #[test]
+    fn shared_vector_matches_the_typescript_side() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let seed: [u8; 32] = std::array::from_fn(|i| i as u8 + 1);
+        let fp: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let digest: [u8; 32] = std::array::from_fn(|i| 255 - i as u8);
+        let msg = signed_message::build_message("vector-session-1", &fp, 0x0001020304050607, &digest);
+        assert_eq!(fp_hex_vec(&msg), VECTOR_MESSAGE_HEX);
+        let key = SigningKey::from_bytes(&seed);
+        assert_eq!(fp_hex_vec(key.verifying_key().as_bytes()), VECTOR_PUBLIC_KEY_HEX);
+        assert_eq!(fp_hex_vec(&key.sign(&msg).to_bytes()), VECTOR_SIGNATURE_HEX);
+        signed_message::verify_signature(&key.verifying_key(), &msg, &BASE64.encode(key.sign(&msg).to_bytes())).unwrap();
+    }
+
+    fn fp_hex_vec(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+    // Expiry 0x0001020304050607 (not 0x0102030405060708): the TS side uses a JS
+    // number, which is exact only below 2^53; this still exercises the high 32 bits.
+    const VECTOR_MESSAGE_HEX: &str = "00000014616374612d6f726469612d7369676e65722f763100000010766563746f722d73657373696f6e2d31000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0001020304050607fffefdfcfbfaf9f8f7f6f5f4f3f2f1f0efeeedecebeae9e8e7e6e5e4e3e2e1e0";
+    const VECTOR_PUBLIC_KEY_HEX: &str = "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664";
+    const VECTOR_SIGNATURE_HEX: &str = "3fc5c1f3eca9ac818876a17795c5a0f365cc8a67f133d9066f499e660c03423c8aa4aa970c7676c07a069eb07802b544b9fec7fcb83360d3d5a66062bdb11a01";
+
+    fn body_text(r: tiny_http::ResponseBox) -> (u16, String) {
+        let status = r.status_code().0;
+        let mut t = String::new();
+        r.into_reader().read_to_string(&mut t).unwrap();
+        (status, t)
+    }
+
+    #[test]
+    fn prepare_failure_responses_are_static_and_keep_codes_and_statuses() {
+        for (f, code, status) in [
+            (PrepareFailure::INVALID_REQUEST, "invalid_request", 400),
+            (PrepareFailure::INVALID_PATH, "invalid_path", 500),
+            (PrepareFailure::READ_FAILED, "read_failed", 500),
+            (PrepareFailure::INVALID_CERTIFICATE, "invalid_certificate", 422),
+            (PrepareFailure::ENCODE_FAILED, "encode_failed", 500),
+            (PrepareFailure::TOKEN_GENERATION_FAILED, "token_generation_failed", 500),
+        ] {
+            let (s, t) = body_text(f.respond());
+            assert_eq!(s, status);
+            assert!(t.contains(code), "body was: {t}");
+        }
+    }
+
+    #[test]
+    fn prepare_nonexistent_path_does_not_leak_path_or_os_error() {
+        let path = std::path::Path::new("/nonexistent-dir-SECRET/cert-SECRET.p12");
+        let Err(f) = read_certificate_file(path) else { panic!("must fail") };
+        let (s, t) = body_text(f.respond());
+        assert_eq!(s, 500);
+        for bad in ["SECRET", "nonexistent", "No such file", "os error", "(os error"] {
+            assert!(!t.contains(bad), "body leaked {bad}: {t}");
+        }
+        assert!(t.contains("read_failed"));
+    }
+
+    #[test]
+    fn prepare_unreadable_file_does_not_leak_path_or_os_error() {
+        // A directory cannot be read as a file: a portable stand-in for an unreadable file.
+        let dir = std::env::temp_dir().join("signer-SECRET-unreadable");
+        std::fs::create_dir_all(&dir).unwrap();
+        let Err(f) = read_certificate_file(&dir) else { panic!("must fail") };
+        let _ = std::fs::remove_dir(&dir);
+        let (s, t) = body_text(f.respond());
+        assert_eq!(s, 500);
+        for bad in ["SECRET", "signer-", "directory", "os error", "Permission denied"] {
+            assert!(!t.contains(bad), "body leaked {bad}: {t}");
+        }
+    }
+
+    #[test]
+    fn prepare_invalid_certificate_does_not_leak_openssl_text() {
+        let Err(f) = parse_pkcs12_der(b"SECRET-not-a-p12") else { panic!("must fail") };
+        let (s, t) = body_text(f.respond());
+        assert_eq!(s, 422);
+        for bad in ["SECRET", "error:", "asn1", "ASN1", "openssl", "OpenSSL"] {
+            assert!(!t.contains(bad), "body leaked {bad}: {t}");
+        }
+        assert!(t.contains("invalid_certificate"));
+    }
+
+    #[test]
+    fn prepare_malformed_body_does_not_echo_values() {
+        let body = r#"{"acta_id":"a","session_id":"s","hmac_token":"t","hmac_timestamp":"SECRET","document_hash":"h","acta_title":"x"}"#;
+        assert!(serde_json::from_str::<PrepareRequest>(body).is_err(), "fixture must be malformed");
+        // handle_prepare maps any parse error to this static response.
+        let (s, t) = body_text(PrepareFailure::INVALID_REQUEST.respond());
+        assert_eq!(s, 400);
+        assert!(!t.contains("SECRET") && !t.contains("expected") && !t.contains("line "), "body was: {t}");
     }
 }
