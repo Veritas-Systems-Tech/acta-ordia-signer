@@ -12,7 +12,7 @@
 //! session-binding check. This is NOT the primary defense against the
 //! signature-oracle finding (an attacker driving both `/prepare` and `/sign`
 //! reads the token out of the `/prepare` response); that is the backend's
-//! Ed25519 signature over the digest, verified in `server.rs::handle_sign`
+//! Ed25519 signature over the tagged signed message, verified in `server.rs::handle_sign`
 //! before this key is ever taken.
 
 use std::collections::HashMap;
@@ -28,6 +28,10 @@ const SESSION_TTL: Duration = Duration::from_secs(15 * 60);
 pub struct PendingSignature {
     pub private_key: PKey<Private>,
     agent_token: String,
+    /// SHA-256 of the DER of the certificate whose key was unlocked at
+    /// `/prepare`. `/sign` requires the backend-signed message to name this
+    /// exact fingerprint.
+    cert_fingerprint: [u8; 32],
     expires_at: Instant,
 }
 
@@ -43,6 +47,9 @@ pub enum TakeError {
     /// the legitimate web app can still complete it, and the 256-bit token
     /// makes brute-forcing via retries infeasible.
     TokenMismatch,
+    /// The backend-signed message is bound to a different certificate than
+    /// the one unlocked for this session. Session NOT consumed.
+    FingerprintMismatch,
 }
 
 pub struct SigningState {
@@ -76,23 +83,35 @@ impl SigningState {
         Self { sessions: Mutex::new(HashMap::new()), ttl }
     }
 
-    pub fn insert(&self, session_id: String, private_key: PKey<Private>, agent_token: String) {
+    pub fn insert(
+        &self,
+        session_id: String,
+        private_key: PKey<Private>,
+        agent_token: String,
+        cert_fingerprint: [u8; 32],
+    ) {
         let mut sessions = self.sessions.lock_or_recover();
         sessions.retain(|_, v| v.expires_at > Instant::now());
         sessions.insert(
             session_id,
-            PendingSignature { private_key, agent_token, expires_at: Instant::now() + self.ttl },
+            PendingSignature { private_key, agent_token, cert_fingerprint, expires_at: Instant::now() + self.ttl },
         );
     }
 
     /// Single-use: removes and returns the key if the session exists, is
     /// unexpired, and `agent_token` matches the one issued at `/prepare`.
     /// A token mismatch leaves the session in place (see [`TakeError`]).
-    pub fn take(&self, session_id: &str, agent_token: &str) -> Result<PKey<Private>, TakeError> {
+    pub fn take(
+        &self,
+        session_id: &str,
+        agent_token: &str,
+        expected_fingerprint: &[u8; 32],
+    ) -> Result<PKey<Private>, TakeError> {
         enum Decision {
             NotFound,
             Expired,
             Mismatch,
+            FingerprintMismatch,
             Take,
         }
 
@@ -105,6 +124,9 @@ impl SigningState {
             Some(entry) if !constant_time_eq(entry.agent_token.as_bytes(), agent_token.as_bytes()) => {
                 Decision::Mismatch
             }
+            Some(entry) if !constant_time_eq(&entry.cert_fingerprint, expected_fingerprint) => {
+                Decision::FingerprintMismatch
+            }
             Some(_) => Decision::Take,
         };
         match decision {
@@ -114,6 +136,7 @@ impl SigningState {
                 Err(TakeError::NotFound)
             }
             Decision::Mismatch => Err(TakeError::TokenMismatch),
+            Decision::FingerprintMismatch => Err(TakeError::FingerprintMismatch),
             Decision::Take => {
                 let entry = sessions.remove(session_id).expect("entry checked present above");
                 Ok(entry.private_key)
@@ -128,6 +151,8 @@ mod tests {
     use openssl::rsa::Rsa;
     use std::thread::sleep;
 
+    const FP: [u8; 32] = [0xAB; 32];
+
     fn test_key() -> PKey<Private> {
         let rsa = Rsa::generate(2048).expect("keygen");
         PKey::from_rsa(rsa).expect("pkey wrap")
@@ -136,17 +161,17 @@ mod tests {
     #[test]
     fn take_returns_the_inserted_key_with_the_right_token() {
         let state = SigningState::default();
-        state.insert("session-1".into(), test_key(), "tok-1".into());
-        assert!(state.take("session-1", "tok-1").is_ok());
+        state.insert("session-1".into(), test_key(), "tok-1".into(), FP);
+        assert!(state.take("session-1", "tok-1", &FP).is_ok());
     }
 
     #[test]
     fn take_is_single_use() {
         let state = SigningState::default();
-        state.insert("session-1".into(), test_key(), "tok-1".into());
-        assert!(state.take("session-1", "tok-1").is_ok());
+        state.insert("session-1".into(), test_key(), "tok-1".into(), FP);
+        assert!(state.take("session-1", "tok-1", &FP).is_ok());
         assert_eq!(
-            state.take("session-1", "tok-1").unwrap_err(),
+            state.take("session-1", "tok-1", &FP).unwrap_err(),
             TakeError::NotFound,
             "a second take must not return the same key"
         );
@@ -155,21 +180,21 @@ mod tests {
     #[test]
     fn take_returns_not_found_for_unknown_session() {
         let state = SigningState::default();
-        assert_eq!(state.take("never-inserted", "tok-1").unwrap_err(), TakeError::NotFound);
+        assert_eq!(state.take("never-inserted", "tok-1", &FP).unwrap_err(), TakeError::NotFound);
     }
 
     #[test]
     fn take_rejects_a_wrong_token_without_consuming_the_session() {
         let state = SigningState::default();
-        state.insert("session-1".into(), test_key(), "the-real-token".into());
+        state.insert("session-1".into(), test_key(), "the-real-token".into(), FP);
         assert_eq!(
-            state.take("session-1", "wrong-token").unwrap_err(),
+            state.take("session-1", "wrong-token", &FP).unwrap_err(),
             TakeError::TokenMismatch,
             "a wrong token must never yield the key"
         );
         // The legitimate caller must still be able to complete the session
         // after an attacker's failed guess.
-        assert!(state.take("session-1", "the-real-token").is_ok());
+        assert!(state.take("session-1", "the-real-token", &FP).is_ok());
     }
 
     #[test]
@@ -177,17 +202,28 @@ mod tests {
         // `/sign` with no `agent_token` field deserializes to "" — that must
         // behave exactly like any other wrong token.
         let state = SigningState::default();
-        state.insert("session-1".into(), test_key(), "the-real-token".into());
-        assert_eq!(state.take("session-1", "").unwrap_err(), TakeError::TokenMismatch);
+        state.insert("session-1".into(), test_key(), "the-real-token".into(), FP);
+        assert_eq!(state.take("session-1", "", &FP).unwrap_err(), TakeError::TokenMismatch);
+    }
+
+    #[test]
+    fn take_rejects_a_wrong_fingerprint_without_consuming_the_session() {
+        let state = SigningState::default();
+        state.insert("session-1".into(), test_key(), "tok-1".into(), FP);
+        assert_eq!(
+            state.take("session-1", "tok-1", &[0xCD; 32]).unwrap_err(),
+            TakeError::FingerprintMismatch,
+        );
+        assert!(state.take("session-1", "tok-1", &FP).is_ok(), "mismatch must not consume the session");
     }
 
     #[test]
     fn take_returns_not_found_after_expiry() {
         let state = SigningState::with_ttl(Duration::from_millis(20));
-        state.insert("session-1".into(), test_key(), "tok-1".into());
+        state.insert("session-1".into(), test_key(), "tok-1".into(), FP);
         sleep(Duration::from_millis(60));
         assert_eq!(
-            state.take("session-1", "tok-1").unwrap_err(),
+            state.take("session-1", "tok-1", &FP).unwrap_err(),
             TakeError::NotFound,
             "an expired session must not be returned"
         );
@@ -198,34 +234,34 @@ mod tests {
         // Expiry wins over token comparison — an expired session must not
         // leak whether a guessed token would have been right.
         let state = SigningState::with_ttl(Duration::from_millis(20));
-        state.insert("session-1".into(), test_key(), "tok-1".into());
+        state.insert("session-1".into(), test_key(), "tok-1".into(), FP);
         sleep(Duration::from_millis(60));
-        assert_eq!(state.take("session-1", "wrong").unwrap_err(), TakeError::NotFound);
+        assert_eq!(state.take("session-1", "wrong", &FP).unwrap_err(), TakeError::NotFound);
     }
 
     #[test]
     fn insert_prunes_other_expired_sessions() {
         let state = SigningState::with_ttl(Duration::from_millis(20));
-        state.insert("stale".into(), test_key(), "tok-stale".into());
+        state.insert("stale".into(), test_key(), "tok-stale".into(), FP);
         sleep(Duration::from_millis(60));
-        state.insert("fresh".into(), test_key(), "tok-fresh".into());
+        state.insert("fresh".into(), test_key(), "tok-fresh".into(), FP);
         // The stale entry should have been pruned as a side effect of the
         // second insert, not just left around forever.
-        assert_eq!(state.take("stale", "tok-stale").unwrap_err(), TakeError::NotFound);
-        assert!(state.take("fresh", "tok-fresh").is_ok());
+        assert_eq!(state.take("stale", "tok-stale", &FP).unwrap_err(), TakeError::NotFound);
+        assert!(state.take("fresh", "tok-fresh", &FP).is_ok());
     }
 
     #[test]
     fn sessions_are_isolated_by_id_and_token() {
         let state = SigningState::default();
-        state.insert("session-a".into(), test_key(), "tok-a".into());
-        state.insert("session-b".into(), test_key(), "tok-b".into());
+        state.insert("session-a".into(), test_key(), "tok-a".into(), FP);
+        state.insert("session-b".into(), test_key(), "tok-b".into(), FP);
         // Tokens are per-session — session-b's token must not open session-a.
-        assert_eq!(state.take("session-a", "tok-b").unwrap_err(), TakeError::TokenMismatch);
-        assert!(state.take("session-a", "tok-a").is_ok());
+        assert_eq!(state.take("session-a", "tok-b", &FP).unwrap_err(), TakeError::TokenMismatch);
+        assert!(state.take("session-a", "tok-a", &FP).is_ok());
         // session-b must still be there — inserting/taking one session must
         // not disturb another.
-        assert!(state.take("session-b", "tok-b").is_ok());
+        assert!(state.take("session-b", "tok-b", &FP).is_ok());
     }
 
     #[test]

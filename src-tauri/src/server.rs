@@ -15,7 +15,7 @@ use std::thread;
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 use openssl::pkcs12::Pkcs12;
 use openssl::pkey::PKey;
 use openssl::rsa::Padding;
@@ -28,6 +28,7 @@ use zeroize::Zeroizing;
 use crate::activity::SignerActivity;
 use crate::passphrase::prompt_passphrase;
 use crate::picker_memory::{last_certificate_dir, remember_certificate_path};
+use crate::protocol::signed_message::{self, Reject};
 use crate::protocol::{ErrorResponse, HealthResponse, PrepareRequest, PrepareResponse, SignDigestRequest, SignDigestResponse};
 use crate::state::{SigningState, TakeError};
 
@@ -114,8 +115,9 @@ const SHA256_DIGEST_INFO_PREFIX: &[u8] = &[
 
 /// Ed25519 public key (raw 32 bytes, hex) whose private half lives only in the
 /// backend's Google Secret Manager (`PKI_DIGEST_SIGNING_PRIVATE_KEY`). Before
-/// signing anything, the agent verifies the backend's signature over the digest
-/// bytes against this key — so a local process cannot feed the agent an
+/// signing anything, the agent verifies the backend's signature over the tagged
+/// signed message (`protocol::signed_message`: domain prefix, session id,
+/// certificate fingerprint, expiry, digest) against this key — so a local process cannot feed the agent an
 /// attacker-chosen digest and use it as a signature oracle (that would require
 /// the backend's private key, which no local attacker has). A public key is
 /// safe to embed in an open-source binary.
@@ -171,20 +173,6 @@ fn test_digest_signing_key() -> &'static ed25519_dalek::SigningKey {
         getrandom::fill(&mut seed).expect("getrandom for test digest key");
         SigningKey::from_bytes(&seed)
     })
-}
-
-/// Verifies the backend's Ed25519 signature over the digest bytes. Returns
-/// `Ok(())` only when `signature_b64` is valid base64, decodes to exactly 64
-/// bytes, and is a valid signature by `vk` over `digest`. Any failure (bad
-/// base64, wrong length, bad signature) is an `Err` — never a panic.
-fn verify_digest_signature(vk: &VerifyingKey, digest: &[u8], signature_b64: &str) -> Result<(), String> {
-    let sig_bytes = BASE64.decode(signature_b64).map_err(|e| e.to_string())?;
-    let sig_arr: [u8; 64] = sig_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| format!("expected a 64-byte signature, got {}", sig_bytes.len()))?;
-    let signature = Signature::from_bytes(&sig_arr);
-    vk.verify(digest, &signature).map_err(|e| e.to_string())
 }
 
 pub fn spawn(app: AppHandle) {
@@ -418,13 +406,17 @@ fn handle_prepare(app: &AppHandle, body: &str) -> tiny_http::ResponseBox {
     }
 
     let mut chain_der_base64 = Vec::new();
-    match cert.to_der() {
-        Ok(der) => chain_der_base64.push(BASE64.encode(der)),
+    let cert_fingerprint = match cert.to_der().map_err(|e| e.to_string()).and_then(|der| {
+        let fp = leaf_fingerprint(&der)?;
+        chain_der_base64.push(BASE64.encode(der));
+        Ok(fp)
+    }) {
+        Ok(fp) => fp,
         Err(err) => {
             app.state::<SignerActivity>().record("failed: encode_failed");
-            return json_response(&ErrorResponse::new("encode_failed", err.to_string()), 500);
+            return json_response(&ErrorResponse::new("encode_failed", err), 500);
         }
-    }
+    };
     if let Some(ca_stack) = parsed.ca {
         for ca_cert in ca_stack.iter() {
             if let Ok(der) = ca_cert.to_der() {
@@ -440,7 +432,7 @@ fn handle_prepare(app: &AppHandle, body: &str) -> tiny_http::ResponseBox {
             return json_response(&ErrorResponse::new("token_generation_failed", err), 500);
         }
     };
-    app.state::<SigningState>().insert(req.session_id, private_key, agent_token.clone());
+    app.state::<SigningState>().insert(req.session_id, private_key, agent_token.clone(), cert_fingerprint);
     app.state::<SignerActivity>().record("prepared");
 
     json_response(
@@ -455,40 +447,52 @@ fn handle_sign(signing_state: &SigningState, activity: &SignerActivity, body: &s
         Err(err) => return json_response(&ErrorResponse::new("invalid_request", err.to_string()), 400),
     };
 
-    let digest = match BASE64.decode(&req.bytes_to_sign_base64) {
-        Ok(d) => d,
-        Err(err) => return json_response(&ErrorResponse::new("invalid_digest", err.to_string()), 400),
+    // Static codes and messages only: nothing from the request is echoed back.
+    let reject = |activity: &SignerActivity, r: Reject| {
+        activity.record(format!("failed: {}", r.code()));
+        json_response(&ErrorResponse::new(r.code(), r.message()), r.status())
     };
-    if digest.len() != 32 {
-        return json_response(&ErrorResponse::new("invalid_digest", "Expected a 32-byte SHA-256 digest."), 400);
+
+    if req.signed_message_version != signed_message::PROTOCOL_VERSION {
+        return reject(activity, Reject::UnsupportedProtocol);
     }
 
-    // The load-bearing check: prove the digest really came from the backend
-    // before doing anything that consumes state. Verifying the backend's
-    // Ed25519 signature against the embedded public key is what stops a local
-    // process from using the agent as a signature oracle over an
-    // attacker-chosen digest (the agent_token below is only a secondary
-    // session-binding convenience). A failure here rejects WITHOUT consuming
-    // the single-use session, so a legitimate retry can still complete.
+    let digest: [u8; 32] = match BASE64.decode(&req.bytes_to_sign_base64).ok().and_then(|d| d.try_into().ok()) {
+        Some(d) => d,
+        None => {
+            return json_response(&ErrorResponse::new("invalid_digest", "Expected a 32-byte SHA-256 digest."), 400)
+        }
+    };
+    let claimed_fingerprint = match signed_message::parse_fingerprint_hex(&req.cert_fingerprint_sha256_hex) {
+        Ok(f) => f,
+        Err(r) => return reject(activity, r),
+    };
+
+    // The load-bearing check: rebuild the tagged message from what we were
+    // handed and verify the backend's Ed25519 signature over it before doing
+    // anything that consumes state. The message binds the domain prefix,
+    // session id, certificate fingerprint, expiry and digest, so a captured
+    // signature is useless for another session, another certificate, or after
+    // expiry, and a local process cannot use the agent as a signature oracle.
+    // A failure here rejects WITHOUT consuming the single-use session.
     //
     // Reported to Sentry: this is also the only signal that would ever catch
     // a deployed-key mismatch (the embedded PKI_DIGEST_PUBLIC_KEY_HEX not
     // actually pairing with the backend's real Secret Manager private key) —
     // that failure mode is otherwise completely silent and would 403 every
     // single real signing attempt forever (see pending-user-actions memory).
-    if let Err(err) = verify_digest_signature(&active_digest_verifying_key(), &digest, &req.digest_signature_base64) {
+    let message = signed_message::build_message(&req.session_id, &claimed_fingerprint, req.expires_at_unix, &digest);
+    if let Err(r) = signed_message::verify_signature(&active_digest_verifying_key(), &message, &req.digest_signature_base64) {
         crate::telemetry::report("invalid_digest_signature");
-        activity.record("failed: invalid_digest_signature");
-        return json_response(
-            &ErrorResponse::new(
-                "invalid_digest_signature",
-                format!("The digest is not signed by the Acta Ordia backend: {err}"),
-            ),
-            403,
-        );
+        return reject(activity, r);
+    }
+    if let Err(r) = signed_message::check_expiry(req.expires_at_unix, now_unix()) {
+        return reject(activity, r);
     }
 
-    let private_key = match signing_state.take(&req.session_id, &req.agent_token) {
+    // The fingerprint is compared against the certificate actually unlocked
+    // at /prepare (inside `take`), not merely against what the request says.
+    let private_key = match signing_state.take(&req.session_id, &req.agent_token, &claimed_fingerprint) {
         Ok(key) => key,
         Err(TakeError::NotFound) => {
             return json_response(
@@ -502,6 +506,7 @@ fn handle_sign(signing_state: &SigningState, activity: &SignerActivity, body: &s
                 403,
             )
         }
+        Err(TakeError::FingerprintMismatch) => return reject(activity, Reject::FingerprintMismatch),
     };
 
     let mut digest_info = Vec::with_capacity(SHA256_DIGEST_INFO_PREFIX.len() + digest.len());
@@ -519,6 +524,19 @@ fn handle_sign(signing_state: &SigningState, activity: &SignerActivity, body: &s
 
     activity.record("signed");
     json_response(&SignDigestResponse { signature_base64: BASE64.encode(signature) }, 200)
+}
+
+/// SHA-256 of a certificate's DER encoding.
+fn leaf_fingerprint(der: &[u8]) -> Result<[u8; 32], String> {
+    let h = openssl::hash::hash(openssl::hash::MessageDigest::sha256(), der).map_err(|e| e.to_string())?;
+    h.as_ref().try_into().map_err(|_| "unexpected SHA-256 length".to_string())
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Raw RSA PKCS1v1.5 sign over an already-built DigestInfo — NOT a hashing
@@ -719,31 +737,53 @@ mod tests {
     /// The 32-byte SHA-256-shaped digest used across these tests.
     const TEST_DIGEST: [u8; 32] = [0x11u8; 32];
 
-    /// A valid 32-byte SHA-256-shaped digest, base64-encoded, as `/sign` wants.
-    fn digest32_b64() -> String {
-        BASE64.encode(TEST_DIGEST)
+    /// Fingerprint the test sessions are "unlocked" with.
+    const TEST_FP: [u8; 32] = [0x22u8; 32];
+
+    fn fp_hex(fp: &[u8; 32]) -> String {
+        fp.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// A valid backend-style Ed25519 signature over `digest`, base64-encoded —
+    /// A backend-style Ed25519 signature over the tagged signed message —
     /// produced with the per-binary test key that `active_digest_verifying_key`
-    /// trusts under `#[cfg(test)]`. This is what a real backend's
-    /// `preparePkiSignatureDigest` returns as `digestSignatureBase64`.
-    fn signed_digest_b64(digest: &[u8]) -> String {
+    /// trusts under `#[cfg(test)]`.
+    fn signed_message_b64(session_id: &str, fp: &[u8; 32], expires: u64, digest: &[u8; 32]) -> String {
         use ed25519_dalek::Signer;
-        BASE64.encode(test_digest_signing_key().sign(digest).to_bytes())
+        let msg = signed_message::build_message(session_id, fp, expires, digest);
+        BASE64.encode(test_digest_signing_key().sign(&msg).to_bytes())
     }
 
-    /// Builds a `/sign` JSON body with a VALID backend digest signature over
-    /// `TEST_DIGEST` — so tests exercising the token/session logic reach it
-    /// instead of being stopped at the digest-signature gate.
-    fn sign_body(session_id: &str, agent_token: Option<&str>) -> String {
-        let token_field = agent_token
-            .map(|t| format!(r#","agent_token":"{t}""#))
-            .unwrap_or_default();
+    /// Full `/sign` body from explicit parts, so tests can corrupt one field.
+    #[allow(clippy::too_many_arguments)]
+    fn sign_body_with(
+        session_id: &str,
+        agent_token: Option<&str>,
+        version: u32,
+        fp_hex_claim: &str,
+        expires: u64,
+        digest: &[u8; 32],
+        signature_b64: &str,
+    ) -> String {
+        let token_field = agent_token.map(|t| format!(r#","agent_token":"{t}""#)).unwrap_or_default();
         format!(
-            r#"{{"session_id":"{session_id}","bytes_to_sign_base64":"{}","digest_signature_base64":"{}"{token_field}}}"#,
-            digest32_b64(),
-            signed_digest_b64(&TEST_DIGEST),
+            r#"{{"session_id":"{session_id}","bytes_to_sign_base64":"{}","digest_signature_base64":"{signature_b64}","signed_message_version":{version},"cert_fingerprint_sha256_hex":"{fp_hex_claim}","expires_at_unix":{expires}{token_field}}}"#,
+            BASE64.encode(digest),
+        )
+    }
+
+    /// Builds a `/sign` body with a fully VALID signed message for
+    /// `TEST_FP`/`TEST_DIGEST`, expiring in 120 s — so tests exercising the
+    /// token/session logic reach it instead of stopping at an earlier gate.
+    fn sign_body(session_id: &str, agent_token: Option<&str>) -> String {
+        let expires = now_unix() + 120;
+        sign_body_with(
+            session_id,
+            agent_token,
+            signed_message::PROTOCOL_VERSION,
+            &fp_hex(&TEST_FP),
+            expires,
+            &TEST_DIGEST,
+            &signed_message_b64(session_id, &TEST_FP, expires, &TEST_DIGEST),
         )
     }
 
@@ -802,7 +842,7 @@ mod tests {
         // token the agent would have issued; everything after that is the real
         // wire path.
         let state = Arc::new(SigningState::default());
-        state.insert("sess-real".into(), test_key(), "the-real-token".into());
+        state.insert("sess-real".into(), test_key(), "the-real-token".into(), TEST_FP);
         let port = spawn_test_server(state);
 
         // (b) Attacker replays the session_id with a WRONG token → 403, and
@@ -826,7 +866,7 @@ mod tests {
         // (c) A `/sign` with the `agent_token` field entirely absent must be a
         // clean 403 (empty token != real token), never a panic/500.
         let state = Arc::new(SigningState::default());
-        state.insert("sess-notoken".into(), test_key(), "the-real-token".into());
+        state.insert("sess-notoken".into(), test_key(), "the-real-token".into(), TEST_FP);
         let port = spawn_test_server(state);
 
         let body = post("/sign", Some(APP_ORIGIN), &sign_body("sess-notoken", None));
@@ -852,7 +892,7 @@ mod tests {
         // cannot obtain a signature. Here a live session exists, the Origin is
         // the real app origin, yet the token is wrong → no signature.
         let state = Arc::new(SigningState::default());
-        state.insert("sess-x".into(), test_key(), "real".into());
+        state.insert("sess-x".into(), test_key(), "real".into(), TEST_FP);
         let port = spawn_test_server(state);
 
         let spoofed = post(
@@ -887,7 +927,7 @@ mod tests {
         // by the cap, so it fails JSON parsing with a 400 instead of being
         // fully buffered into memory or accepted.
         let state = Arc::new(SigningState::default());
-        state.insert("sess-real".into(), test_key(), "real".into());
+        state.insert("sess-real".into(), test_key(), "real".into(), TEST_FP);
         let port = spawn_test_server(state);
 
         // 20KB of junk — 4KB past the cap. If the cap were removed this would
@@ -976,86 +1016,209 @@ mod tests {
         let _ = production_verifying_key(); // must not panic
     }
 
-    #[test]
-    fn verify_digest_signature_accepts_a_valid_signature_from_its_key() {
-        // (a) Verification logic itself is correct: a signature made by a
-        // keypair verifies against that same keypair's public key.
-        use ed25519_dalek::Signer;
-        let sk = ephemeral_signing_key();
-        let sig_b64 = BASE64.encode(sk.sign(&TEST_DIGEST).to_bytes());
-        assert!(verify_digest_signature(&sk.verifying_key(), &TEST_DIGEST, &sig_b64).is_ok());
-    }
-
-    #[test]
-    fn verify_digest_signature_rejects_a_different_keypair_against_production_key() {
-        // (b) A signature valid under some OTHER keypair must be rejected when
-        // checked against the real embedded production key — exactly the
-        // attacker who lacks the backend's private key.
-        use ed25519_dalek::Signer;
-        let attacker = ephemeral_signing_key();
-        let sig_b64 = BASE64.encode(attacker.sign(&TEST_DIGEST).to_bytes());
-        assert!(
-            verify_digest_signature(&production_verifying_key(), &TEST_DIGEST, &sig_b64).is_err(),
-            "a signature not made by the backend key must never verify against the embedded key"
-        );
-    }
-
-    #[test]
-    fn verify_digest_signature_rejects_malformed_input_without_panicking() {
-        // (c) Empty, non-base64, and wrong-length inputs are all clean errors.
-        let vk = production_verifying_key();
-        assert!(verify_digest_signature(&vk, &TEST_DIGEST, "").is_err(), "empty");
-        assert!(verify_digest_signature(&vk, &TEST_DIGEST, "not base64 !!!").is_err(), "non-base64");
-        // Valid base64 but far too short (10 bytes, not 64).
-        assert!(verify_digest_signature(&vk, &TEST_DIGEST, &BASE64.encode([0u8; 10])).is_err(), "short");
-        // Valid base64, correct 64-byte length, but not a real signature.
-        assert!(verify_digest_signature(&vk, &TEST_DIGEST, &BASE64.encode([0u8; 64])).is_err(), "zeros");
-    }
-
-    #[test]
-    fn verify_digest_signature_rejects_a_one_byte_flip() {
-        // (d) Flipping a single byte of an otherwise-valid signature must fail.
-        use ed25519_dalek::Signer;
-        let sk = ephemeral_signing_key();
-        let mut sig_bytes = sk.sign(&TEST_DIGEST).to_bytes();
-        assert!(
-            verify_digest_signature(&sk.verifying_key(), &TEST_DIGEST, &BASE64.encode(sig_bytes)).is_ok(),
-            "sanity: the unflipped signature must verify"
-        );
-        sig_bytes[0] ^= 0x01;
-        assert!(
-            verify_digest_signature(&sk.verifying_key(), &TEST_DIGEST, &BASE64.encode(sig_bytes)).is_err(),
-            "a tampered signature must never verify"
-        );
-    }
-
-    #[test]
-    fn http_sign_with_bad_digest_signature_is_403_and_does_not_consume_session() {
-        // The wire-level guarantee: a digest NOT signed by the backend is
-        // rejected with 403 invalid_digest_signature, and — because the check
-        // happens before the session is taken — the legitimate caller can
-        // still complete afterwards with the real backend signature.
-        use ed25519_dalek::Signer;
+    /// Boots a server with one live session and returns its port.
+    fn port_with_session(session: &str) -> u16 {
         let state = Arc::new(SigningState::default());
-        state.insert("sess-badsig".into(), test_key(), "real".into());
-        let port = spawn_test_server(state);
+        state.insert(session.into(), test_key(), "real".into(), TEST_FP);
+        spawn_test_server(state)
+    }
 
+    fn sign_status(port: u16, body: &str) -> (u16, String) {
+        http_send(port, &post("/sign", Some(APP_ORIGIN), body))
+    }
+
+    #[test]
+    fn http_sign_with_a_signature_from_another_key_is_403_and_does_not_consume_session() {
+        use ed25519_dalek::Signer;
+        let port = port_with_session("sess-badsig");
         let attacker = ephemeral_signing_key();
-        let bad_sig = BASE64.encode(attacker.sign(&TEST_DIGEST).to_bytes());
-        let body = format!(
-            r#"{{"session_id":"sess-badsig","bytes_to_sign_base64":"{}","digest_signature_base64":"{}","agent_token":"real"}}"#,
-            digest32_b64(),
-            bad_sig,
-        );
-        let (status, resp) = http_send(port, &post("/sign", Some(APP_ORIGIN), &body));
-        assert_eq!(status, 403, "an unbacked digest must be rejected");
+        let expires = now_unix() + 120;
+        let msg = signed_message::build_message("sess-badsig", &TEST_FP, expires, &TEST_DIGEST);
+        let bad = BASE64.encode(attacker.sign(&msg).to_bytes());
+        let body = sign_body_with("sess-badsig", Some("real"), 1, &fp_hex(&TEST_FP), expires, &TEST_DIGEST, &bad);
+        let (status, resp) = sign_status(port, &body);
+        assert_eq!(status, 403);
         assert!(resp.contains("invalid_digest_signature"), "body was: {resp}");
 
-        // Session was NOT consumed — a real backend-signed /sign still works.
-        let good = post("/sign", Some(APP_ORIGIN), &sign_body("sess-badsig", Some("real")));
-        let (status, resp) = http_send(port, &good);
-        assert_eq!(status, 200, "a rejected bad-signature attempt must not consume the session");
+        let (status, resp) = sign_status(port, &sign_body("sess-badsig", Some("real")));
+        assert_eq!(status, 200, "a rejected attempt must not consume the session");
         assert!(resp.contains("signature_base64"), "body was: {resp}");
+    }
+
+    #[test]
+    fn http_sign_good_message_passes() {
+        let port = port_with_session("sess-ok");
+        let (status, resp) = sign_status(port, &sign_body("sess-ok", Some("real")));
+        assert_eq!(status, 200, "body was: {resp}");
+    }
+
+    #[test]
+    fn http_sign_wrong_session_id_in_message_fails() {
+        // Signature was minted for another session id, replayed under this one.
+        let port = port_with_session("sess-a");
+        let expires = now_unix() + 120;
+        let sig = signed_message_b64("sess-OTHER", &TEST_FP, expires, &TEST_DIGEST);
+        let body = sign_body_with("sess-a", Some("real"), 1, &fp_hex(&TEST_FP), expires, &TEST_DIGEST, &sig);
+        let (status, resp) = sign_status(port, &body);
+        assert_eq!(status, 403);
+        assert!(resp.contains("invalid_digest_signature"), "body was: {resp}");
+        assert!(!resp.contains("sess-OTHER") && !resp.contains("sess-a"), "no request data in errors: {resp}");
+    }
+
+    #[test]
+    fn http_sign_fingerprint_not_matching_unlocked_cert_fails() {
+        // The backend legitimately signed a message for a DIFFERENT certificate
+        // (valid signature), but the agent unlocked TEST_FP.
+        let port = port_with_session("sess-fp");
+        let other = [0x33u8; 32];
+        let expires = now_unix() + 120;
+        let sig = signed_message_b64("sess-fp", &other, expires, &TEST_DIGEST);
+        let body = sign_body_with("sess-fp", Some("real"), 1, &fp_hex(&other), expires, &TEST_DIGEST, &sig);
+        let (status, resp) = sign_status(port, &body);
+        assert_eq!(status, 403);
+        assert!(resp.contains("fingerprint_mismatch"), "body was: {resp}");
+        // Not consumed.
+        let (status, _) = sign_status(port, &sign_body("sess-fp", Some("real")));
+        assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn http_sign_claimed_fingerprint_differs_from_signed_one_fails() {
+        // Request claims the unlocked cert's fingerprint, but the backend
+        // signed a message for another cert: rebuilt message differs.
+        let port = port_with_session("sess-fp2");
+        let other = [0x33u8; 32];
+        let expires = now_unix() + 120;
+        let sig = signed_message_b64("sess-fp2", &other, expires, &TEST_DIGEST);
+        let body = sign_body_with("sess-fp2", Some("real"), 1, &fp_hex(&TEST_FP), expires, &TEST_DIGEST, &sig);
+        let (status, resp) = sign_status(port, &body);
+        assert_eq!(status, 403);
+        assert!(resp.contains("invalid_digest_signature"), "body was: {resp}");
+    }
+
+    #[test]
+    fn http_sign_expired_message_fails() {
+        let port = port_with_session("sess-exp");
+        let expires = now_unix() - (signed_message::EXPIRY_SKEW_SECS + 30);
+        let sig = signed_message_b64("sess-exp", &TEST_FP, expires, &TEST_DIGEST);
+        let body = sign_body_with("sess-exp", Some("real"), 1, &fp_hex(&TEST_FP), expires, &TEST_DIGEST, &sig);
+        let (status, resp) = sign_status(port, &body);
+        assert_eq!(status, 403);
+        assert!(resp.contains("signature_expired"), "body was: {resp}");
+        // Within skew is still accepted.
+        let expires = now_unix() - (signed_message::EXPIRY_SKEW_SECS - 30);
+        let sig = signed_message_b64("sess-exp", &TEST_FP, expires, &TEST_DIGEST);
+        let body = sign_body_with("sess-exp", Some("real"), 1, &fp_hex(&TEST_FP), expires, &TEST_DIGEST, &sig);
+        assert_eq!(sign_status(port, &body).0, 200);
+    }
+
+    #[test]
+    fn http_sign_altered_digest_fails() {
+        let port = port_with_session("sess-dig");
+        let expires = now_unix() + 120;
+        let sig = signed_message_b64("sess-dig", &TEST_FP, expires, &TEST_DIGEST);
+        let altered = [0x99u8; 32];
+        let body = sign_body_with("sess-dig", Some("real"), 1, &fp_hex(&TEST_FP), expires, &altered, &sig);
+        let (status, resp) = sign_status(port, &body);
+        assert_eq!(status, 403);
+        assert!(resp.contains("invalid_digest_signature"), "body was: {resp}");
+    }
+
+    #[test]
+    fn http_sign_altered_expiry_fails() {
+        // Extending the expiry after the fact invalidates the signature.
+        let port = port_with_session("sess-ext");
+        let signed_exp = now_unix() - 1000;
+        let sig = signed_message_b64("sess-ext", &TEST_FP, signed_exp, &TEST_DIGEST);
+        let body = sign_body_with("sess-ext", Some("real"), 1, &fp_hex(&TEST_FP), now_unix() + 120, &TEST_DIGEST, &sig);
+        let (status, resp) = sign_status(port, &body);
+        assert_eq!(status, 403);
+        assert!(resp.contains("invalid_digest_signature"), "body was: {resp}");
+    }
+
+    #[test]
+    fn http_sign_signature_over_bare_digest_or_wrong_prefix_fails() {
+        // Legacy behaviour (signature over the bare digest), a message with no
+        // domain prefix, and one with a different prefix must all fail.
+        use ed25519_dalek::Signer;
+        let port = port_with_session("sess-pre");
+        let expires = now_unix() + 120;
+        let key = test_digest_signing_key();
+        let layout = |prefix: &[u8]| {
+            let mut m = Vec::new();
+            m.extend_from_slice(&(prefix.len() as u32).to_be_bytes());
+            m.extend_from_slice(prefix);
+            m.extend_from_slice(&("sess-pre".len() as u32).to_be_bytes());
+            m.extend_from_slice(b"sess-pre");
+            m.extend_from_slice(&TEST_FP);
+            m.extend_from_slice(&expires.to_be_bytes());
+            m.extend_from_slice(&TEST_DIGEST);
+            m
+        };
+        let no_prefix = {
+            let mut m = Vec::new();
+            m.extend_from_slice(&("sess-pre".len() as u32).to_be_bytes());
+            m.extend_from_slice(b"sess-pre");
+            m.extend_from_slice(&TEST_FP);
+            m.extend_from_slice(&expires.to_be_bytes());
+            m.extend_from_slice(&TEST_DIGEST);
+            m
+        };
+        let candidates: Vec<Vec<u8>> =
+            vec![TEST_DIGEST.to_vec(), no_prefix, layout(b"acta-ordia-signer/v0"), layout(b"other-app/v1"), layout(b"")];
+        for msg in candidates {
+            let sig = BASE64.encode(key.sign(&msg).to_bytes());
+            let body = sign_body_with("sess-pre", Some("real"), 1, &fp_hex(&TEST_FP), expires, &TEST_DIGEST, &sig);
+            let (status, resp) = sign_status(port, &body);
+            assert_eq!(status, 403);
+            assert!(resp.contains("invalid_digest_signature"), "body was: {resp}");
+        }
+        // Sanity: the correct prefix verifies.
+        let good = BASE64.encode(key.sign(&layout(signed_message::DOMAIN_PREFIX)).to_bytes());
+        let body = sign_body_with("sess-pre", Some("real"), 1, &fp_hex(&TEST_FP), expires, &TEST_DIGEST, &good);
+        assert_eq!(sign_status(port, &body).0, 200);
+    }
+
+    #[test]
+    fn http_sign_missing_or_wrong_protocol_version_is_unsupported_protocol() {
+        let port = port_with_session("sess-ver");
+        // Old web app: no new fields at all, legacy digest-only signature.
+        use ed25519_dalek::Signer;
+        let legacy_sig = BASE64.encode(test_digest_signing_key().sign(&TEST_DIGEST).to_bytes());
+        let legacy = format!(
+            r#"{{"session_id":"sess-ver","bytes_to_sign_base64":"{}","digest_signature_base64":"{legacy_sig}","agent_token":"real"}}"#,
+            BASE64.encode(TEST_DIGEST)
+        );
+        let (status, resp) = sign_status(port, &legacy);
+        assert_eq!(status, 400);
+        assert!(resp.contains("unsupported_protocol"), "body was: {resp}");
+
+        let expires = now_unix() + 120;
+        let sig = signed_message_b64("sess-ver", &TEST_FP, expires, &TEST_DIGEST);
+        let body = sign_body_with("sess-ver", Some("real"), 2, &fp_hex(&TEST_FP), expires, &TEST_DIGEST, &sig);
+        let (status, resp) = sign_status(port, &body);
+        assert_eq!(status, 400);
+        assert!(resp.contains("unsupported_protocol"), "body was: {resp}");
+    }
+
+    #[test]
+    fn http_sign_malformed_fingerprint_is_rejected_statically() {
+        let port = port_with_session("sess-bad-fp");
+        let expires = now_unix() + 120;
+        let sig = signed_message_b64("sess-bad-fp", &TEST_FP, expires, &TEST_DIGEST);
+        let body = sign_body_with("sess-bad-fp", Some("real"), 1, "zz-not-hex", expires, &TEST_DIGEST, &sig);
+        let (status, resp) = sign_status(port, &body);
+        assert_eq!(status, 400);
+        assert!(resp.contains("invalid_fingerprint") && !resp.contains("zz-not-hex"), "body was: {resp}");
+    }
+
+    #[test]
+    fn leaf_fingerprint_is_sha256_of_der() {
+        // SHA-256("abc")
+        assert_eq!(
+            fp_hex(&leaf_fingerprint(b"abc").unwrap()),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]

@@ -54,20 +54,28 @@ revealed to the backend *before* a digest can even exist. Full flow:
      per-session shared secret that `/sign` will require back.
 4. Web app forwards that chain to the backend's `preparePkiSignatureDigest`
    callable, which returns a pre-hashed **SHA-256 digest** — not raw
-   document bytes, not the PDF — **plus an Ed25519 signature over that digest**
-   (`digestSignatureBase64`), produced with a private key held only in the
+   document bytes, not the PDF — **plus an Ed25519 signature over a tagged
+   message that binds that digest** (`digestSignatureBase64`, see "Signed
+   message v1" below), along with the session expiry and the leaf-certificate
+   fingerprint it was bound to. The key is held only in the
    backend's Secret Manager (`PKI_DIGEST_SIGNING_PRIVATE_KEY`). (Forge's own
    signing hook on the backend only exposes an already-hashed digest — which
    happens to match the native mode of Windows `CryptSignHash`, macOS
    `SecKeyCreateSignature`, and PKCS#11's `CKM_RSA_PKCS`, so A3 tokens will use
    the identical contract later.)
 5. Web app calls this agent's `POST /sign` with that digest, the backend's
-   `digest_signature_base64`, **and the `agent_token` from step 3**. Before
-   anything is signed or any state is consumed, the agent **verifies the
-   Ed25519 signature over the digest against its embedded public key** — this
-   is what proves the digest actually came from the backend. A bad, wrong, or
-   missing signature → `403 invalid_digest_signature`, session left intact. It
-   also checks the `agent_token` (constant-time compare; missing/wrong →
+   `digest_signature_base64`, `signed_message_version`,
+   `cert_fingerprint_sha256_hex`, `expires_at_unix`, **and the `agent_token`
+   from step 3**. Before anything is signed or any state is consumed, the
+   agent **rebuilds the signed message from those fields and verifies the
+   Ed25519 signature over it against its embedded public key** — this is what
+   proves the digest came from the backend for *this* session and
+   certificate. It then checks the expiry against its local clock and that the
+   fingerprint equals the certificate it unlocked at `/prepare`. Any failure
+   returns a static error code (`unsupported_protocol`,
+   `invalid_fingerprint`, `invalid_digest_signature`, `signature_expired`,
+   `fingerprint_mismatch`) with no request data in the text, session left
+   intact. It also checks the `agent_token` (constant-time compare; missing/wrong →
    `403 invalid_agent_token`, session left intact) as a secondary
    session-binding step. Only then does it build a DigestInfo (SHA-256 OID +
    digest), sign it with a **raw RSA PKCS1v1.5 encrypt** (not a hashing sign
@@ -143,7 +151,8 @@ libssl-dev`. This confirms:
 Applied after an adversarial audit (`SECURITY_AUDIT_2026-07-20.md`):
 
 - **Backend Ed25519 digest signature** (finding 1, critical — the real fix):
-  the backend signs the digest with an Ed25519 private key held only in Secret
+  the backend signs a tagged message (below) containing the digest with an
+  Ed25519 private key held only in Secret
   Manager (`PKI_DIGEST_SIGNING_PRIVATE_KEY`) and returns the signature to the
   browser; `/sign` verifies it against an embedded public key
   (`PKI_DIGEST_PUBLIC_KEY_HEX` in `server.rs`) **before signing or consuming
@@ -152,6 +161,10 @@ Applied after an adversarial audit (`SECURITY_AUDIT_2026-07-20.md`):
   the agent as a signature oracle" gap: forging a valid signature for an
   attacker-chosen digest requires the backend's private key, which no local
   process has. A public key is safe to ship in an open-source binary.
+  (Originally the signature covered only the bare digest; that let a captured
+  digest/signature pair be reused while any session had an unlocked key. It
+  now covers the message below, so it is bound to one session, one
+  certificate and a short expiry.)
 - **Per-session `agent_token`** (secondary, *not* load-bearing): `/prepare`
   returns a 256-bit CSPRNG token; `/sign` requires it back. This was the
   original finding-1 fix attempt, but a later red-team pass showed it does not
@@ -180,10 +193,32 @@ Applied after an adversarial audit (`SECURITY_AUDIT_2026-07-20.md`):
   (finding 7), matching the passphrase prompt — one abandoned dialog no
   longer wedges the single-threaded listener forever.
 
+#### Signed message v1
+
+The bytes the backend signs (mirror: `functions/src/signing/signed-message.ts`
+in the main repo; agent side: `protocol::signed_message`). Integers are
+big-endian; variable fields are length-prefixed, the rest fixed-width:
+
+```
+u32 len || "acta-ordia-signer/v1"      domain prefix (carries the version)
+u32 len || session_id (UTF-8)
+32 bytes   SHA-256 of the leaf certificate DER
+u64        expiry, unix seconds
+32 bytes   SHA-256 digest of the CMS signed attributes
+```
+
+The agent accepts a message until `expiry + 60 s` by its own clock
+(`EXPIRY_SKEW_SECS`, tolerance for a fast local clock; the backend issues
+120 s lifetimes capped at the session expiry). `/sign` requests without
+`signed_message_version: 1` are rejected with `unsupported_protocol`. Older
+agents verify a signature over the bare digest, so against the new backend
+they fail with `invalid_digest_signature` and must be updated.
+
 The web-app counterpart (`src/lib/pkiSigning.ts` +
 `PkiSignaturePanel.tsx` in the main repo) forwards both the backend's
-`digest_signature_base64` (from `preparePkiSignatureDigest`) and the
-`agent_token` (from the `/prepare` response) into `/sign`. The backend change
+`digest_signature_base64`, `signed_message_version`,
+`cert_fingerprint_sha256_hex` and `expires_at_unix` (from
+`preparePkiSignatureDigest`) and the `agent_token` (from the `/prepare` response) into `/sign`. The backend change
 is the digest-signing step in `functions/src/signing/prepare-digest.ts` — the
 `agent_token` itself never transits the backend.
 
@@ -275,7 +310,8 @@ same as correct at runtime against real inputs:**
   the private key, and the passphrase never transit the network. The origin
   allowlist stops browser-JS CSRF only; protection against other local
   processes comes from verifying the backend's Ed25519 signature over the
-  digest against the agent's embedded public key before signing (the
+  tagged signed message (session, certificate fingerprint, expiry, digest)
+  against the agent's embedded public key before signing (the
   per-session `agent_token` is only a secondary session-binding check, not
   the primary defense — see the security hardening notes above).
 - The agent does send crash/error telemetry to a dedicated Sentry project

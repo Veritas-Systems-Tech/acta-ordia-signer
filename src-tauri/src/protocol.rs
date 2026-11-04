@@ -66,7 +66,7 @@ pub struct PrepareResponse {
     /// session-binding convenience. It is NOT what closes the signature-oracle
     /// finding: an attacker driving both `/prepare` and `/sign` just reads this
     /// token out of the `/prepare` response. The load-bearing defense is the
-    /// backend's Ed25519 signature over the digest (`SignDigestRequest.
+    /// backend's Ed25519 signature over the signed message (`SignDigestRequest.
     /// digest_signature_base64`), verified against the agent's embedded public
     /// key before signing.
     pub agent_token: String,
@@ -76,7 +76,8 @@ pub struct PrepareResponse {
 /// `/prepare` call whose stashed key hasn't expired or already been used.
 ///
 /// `digest_signature_base64` is the load-bearing defense: the backend's
-/// Ed25519 signature over `bytes_to_sign_base64`, verified against the
+/// Ed25519 signature over the tagged signed message (see [`signed_message`]) that
+/// binds `bytes_to_sign_base64`, verified against the
 /// agent's embedded public key before anything is signed. It is a **required**
 /// field with no serde default — a missing digest signature is an explicit
 /// deserialize failure (400 `invalid_request`), never a silent bypass, so no
@@ -92,6 +93,18 @@ pub struct SignDigestRequest {
     pub session_id: String,
     pub bytes_to_sign_base64: String,
     pub digest_signature_base64: String,
+    /// Signed-message protocol version (see [`signed_message`]). Defaults to
+    /// 0 so a web app that predates the tagged message gets the explicit
+    /// `unsupported_protocol` rejection rather than a serde 400.
+    #[serde(default)]
+    pub signed_message_version: u32,
+    /// Lowercase hex SHA-256 of the leaf certificate DER the backend bound
+    /// the signature to. Compared with the certificate actually unlocked.
+    #[serde(default)]
+    pub cert_fingerprint_sha256_hex: String,
+    /// Expiry (unix seconds) bound into the backend signature.
+    #[serde(default)]
+    pub expires_at_unix: u64,
     /// Defaults to empty (rather than a serde missing-field 400) so a
     /// missing token gets the explicit `invalid_agent_token` rejection.
     #[serde(default)]
@@ -118,6 +131,130 @@ pub struct ErrorResponse {
 impl ErrorResponse {
     pub fn new(error: &'static str, message: impl Into<String>) -> Self {
         Self { error, message: message.into() }
+    }
+}
+
+/// The backend-signed message ("signed message v1") the agent verifies before
+/// signing. The backend's Ed25519 signature covers THIS byte string, not the
+/// bare digest, so it is bound to one session, one certificate, a short
+/// expiry, and this protocol (domain separation).
+///
+/// Layout (all integers big-endian; every variable-length field is
+/// length-prefixed, every other field is fixed-width, so no two distinct
+/// field tuples can encode to the same bytes):
+///
+/// ```text
+/// u32  len(DOMAIN_PREFIX)      || DOMAIN_PREFIX  ("acta-ordia-signer/v1")
+/// u32  len(session_id utf-8)   || session_id
+/// [32] SHA-256 of leaf certificate DER
+/// u64  expiry, unix seconds
+/// [32] SHA-256 digest of the CMS signed attributes
+/// ```
+///
+/// The backend mirror is `functions/src/signing/signed-message.ts`.
+pub mod signed_message {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    /// Domain-separation tag; the version is part of it, so a v2 message can
+    /// never verify as a v1 message.
+    pub const DOMAIN_PREFIX: &[u8] = b"acta-ordia-signer/v1";
+    /// Value of the `signed_message_version` request field for this layout.
+    pub const PROTOCOL_VERSION: u32 = 1;
+    /// Tolerated local-clock skew, seconds. The agent accepts a message until
+    /// `expires_at_unix + EXPIRY_SKEW_SECS` by its own clock, so a user whose
+    /// clock runs up to a minute fast is not locked out. The backend issues
+    /// short lifetimes (120 s), so this bounds replay at ~3 minutes at most.
+    pub const EXPIRY_SKEW_SECS: u64 = 60;
+
+    /// Static rejection codes. Never carry user data.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Reject {
+        UnsupportedProtocol,
+        InvalidFingerprint,
+        InvalidDigestSignature,
+        SignatureExpired,
+        FingerprintMismatch,
+    }
+
+    impl Reject {
+        pub fn code(self) -> &'static str {
+            match self {
+                Reject::UnsupportedProtocol => "unsupported_protocol",
+                Reject::InvalidFingerprint => "invalid_fingerprint",
+                Reject::InvalidDigestSignature => "invalid_digest_signature",
+                Reject::SignatureExpired => "signature_expired",
+                Reject::FingerprintMismatch => "fingerprint_mismatch",
+            }
+        }
+        /// Static human text, safe to show; contains no request data.
+        pub fn message(self) -> &'static str {
+            match self {
+                Reject::UnsupportedProtocol => {
+                    "This signer and Acta Ordia use different signing protocol versions. Update the Acta Ordia Signer."
+                }
+                Reject::InvalidFingerprint => "The certificate fingerprint is malformed.",
+                Reject::InvalidDigestSignature => "The signing request is not authenticated by the Acta Ordia backend.",
+                Reject::SignatureExpired => "The signing request has expired. Start the signing again.",
+                Reject::FingerprintMismatch => "The signing request is for a different certificate.",
+            }
+        }
+        pub fn status(self) -> u16 {
+            match self {
+                Reject::UnsupportedProtocol | Reject::InvalidFingerprint => 400,
+                _ => 403,
+            }
+        }
+    }
+
+    /// Builds the exact byte string the backend signs.
+    pub fn build_message(
+        session_id: &str,
+        cert_fingerprint: &[u8; 32],
+        expires_at_unix: u64,
+        digest: &[u8; 32],
+    ) -> Vec<u8> {
+        let mut m = Vec::with_capacity(4 + DOMAIN_PREFIX.len() + 4 + session_id.len() + 32 + 8 + 32);
+        m.extend_from_slice(&(DOMAIN_PREFIX.len() as u32).to_be_bytes());
+        m.extend_from_slice(DOMAIN_PREFIX);
+        m.extend_from_slice(&(session_id.len() as u32).to_be_bytes());
+        m.extend_from_slice(session_id.as_bytes());
+        m.extend_from_slice(cert_fingerprint);
+        m.extend_from_slice(&expires_at_unix.to_be_bytes());
+        m.extend_from_slice(digest);
+        m
+    }
+
+    /// Verifies the Ed25519 signature over the rebuilt message.
+    pub fn verify_signature(
+        vk: &VerifyingKey,
+        message: &[u8],
+        signature_b64: &str,
+    ) -> Result<(), Reject> {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+        let bytes = BASE64.decode(signature_b64).map_err(|_| Reject::InvalidDigestSignature)?;
+        let arr: [u8; 64] = bytes.as_slice().try_into().map_err(|_| Reject::InvalidDigestSignature)?;
+        vk.verify(message, &Signature::from_bytes(&arr)).map_err(|_| Reject::InvalidDigestSignature)
+    }
+
+    /// Expiry check against an explicit `now` (unix seconds) so it is testable.
+    pub fn check_expiry(expires_at_unix: u64, now_unix: u64) -> Result<(), Reject> {
+        if now_unix > expires_at_unix.saturating_add(EXPIRY_SKEW_SECS) {
+            Err(Reject::SignatureExpired)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Strict lowercase-or-uppercase hex decode of exactly 32 bytes.
+    pub fn parse_fingerprint_hex(s: &str) -> Result<[u8; 32], Reject> {
+        if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Reject::InvalidFingerprint);
+        }
+        let mut out = [0u8; 32];
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|_| Reject::InvalidFingerprint)?;
+        }
+        Ok(out)
     }
 }
 
@@ -208,5 +345,59 @@ mod tests {
         let json: serde_json::Value = serde_json::to_value(&res).expect("serialize");
         assert_eq!(json["error"], "no_certificate");
         assert_eq!(json["message"], "No certificate file was selected.");
+    }
+
+    // ----- signed message v1 -------------------------------------------------
+
+    #[test]
+    fn signed_message_layout_is_exact() {
+        use signed_message::*;
+        let m = build_message("ab", &[1u8; 32], 0x0102030405060708, &[2u8; 32]);
+        let mut want = Vec::new();
+        want.extend_from_slice(&[0, 0, 0, 20]);
+        want.extend_from_slice(b"acta-ordia-signer/v1");
+        want.extend_from_slice(&[0, 0, 0, 2]);
+        want.extend_from_slice(b"ab");
+        want.extend_from_slice(&[1u8; 32]);
+        want.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        want.extend_from_slice(&[2u8; 32]);
+        assert_eq!(m, want);
+    }
+
+    #[test]
+    fn signed_message_is_unambiguous_across_field_boundaries() {
+        use signed_message::*;
+        // Same concatenated text, different session id: must differ.
+        let a = build_message("ab", &[0u8; 32], 5, &[0u8; 32]);
+        let b = build_message("abc", &[0u8; 32], 5, &[0u8; 32]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn expiry_boundaries_and_skew() {
+        use signed_message::*;
+        assert!(check_expiry(1000, 999).is_ok());
+        assert!(check_expiry(1000, 1000 + EXPIRY_SKEW_SECS).is_ok());
+        assert_eq!(check_expiry(1000, 1001 + EXPIRY_SKEW_SECS), Err(Reject::SignatureExpired));
+        assert!(check_expiry(u64::MAX, 5).is_ok(), "no overflow");
+    }
+
+    #[test]
+    fn fingerprint_hex_parsing_is_strict() {
+        use signed_message::*;
+        assert!(parse_fingerprint_hex(&"ab".repeat(32)).is_ok());
+        assert_eq!(parse_fingerprint_hex(""), Err(Reject::InvalidFingerprint));
+        assert_eq!(parse_fingerprint_hex(&"ab".repeat(31)), Err(Reject::InvalidFingerprint));
+        assert_eq!(parse_fingerprint_hex(&"zz".repeat(32)), Err(Reject::InvalidFingerprint));
+    }
+
+    #[test]
+    fn reject_texts_are_static_and_codes_unique() {
+        use signed_message::Reject::*;
+        let all = [UnsupportedProtocol, InvalidFingerprint, InvalidDigestSignature, SignatureExpired, FingerprintMismatch];
+        let mut codes: Vec<_> = all.iter().map(|r| r.code()).collect();
+        codes.sort();
+        codes.dedup();
+        assert_eq!(codes.len(), all.len());
     }
 }
