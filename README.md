@@ -330,8 +330,12 @@ same as correct at runtime against real inputs:**
   (`src-tauri/src/telemetry.rs`) — deliberately narrow: only static,
   whitelisted error *codes* (e.g. `"invalid_certificate"`), never the error
   message text, the passphrase, `.p12`/certificate bytes, or the acta title.
-  `send_default_pii` is off. This is disclosed here because "does not phone
-  home" would otherwise overstate what the agent does.
+  `send_default_pii` is off. Panic reports are scrubbed before sending: the
+  machine's hostname (which Sentry attaches on its own) is dropped and the
+  panic message is replaced by a fixed string, leaving the backtrace
+  (function names, file and line). They still carry the OS name and version,
+  kernel version, CPU architecture and Rust version. This is disclosed here
+  because "does not phone home" would otherwise overstate what the agent does.
 - It signs only backend-issued Acta Ordia signing sessions — it is not a
   generic document signer for arbitrary input.
 - The private key is held in memory only, for a short TTL, single-use, and
